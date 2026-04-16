@@ -23,7 +23,10 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
+# Logs
+logs/
+*.log
+
 # TIFF data (source, preview, processed)
 *.tif
 *.tiff
-

@@ -2,19 +2,24 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+if "MPLCONFIGDIR" not in os.environ:
+    os.environ["MPLCONFIGDIR"] = str(Path(tempfile.gettempdir()) / "mplconfig")
 from matplotlib import cm
 from scipy import ndimage as ndi
 from skimage import color, filters, morphology
 from tifffile import TiffFile, imread, imwrite
 
-from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QThread, Qt, QtMsgType, pyqtSignal, pyqtSlot, qInstallMessageHandler
 from PyQt6.QtGui import QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -39,6 +44,64 @@ from PyQt6.QtWidgets import (
 
 def clamp01(x: np.ndarray) -> np.ndarray:
     return np.clip(x, 0.0, 1.0)
+
+
+APP_LOGGER_NAME = "chroma_blotch"
+LOG = logging.getLogger(APP_LOGGER_NAME)
+QT_LOG = logging.getLogger(f"{APP_LOGGER_NAME}.qt")
+
+
+def setup_logging(log_dir: Path, console_level: str = "INFO"):
+    log_dir.mkdir(parents=True, exist_ok=True)
+    info_path = log_dir / "chroma_blotch_info.log"
+    debug_path = log_dir / "chroma_blotch_debug.log"
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+    info_handler = logging.FileHandler(info_path, encoding="utf-8")
+    info_handler.setLevel(logging.INFO)
+    info_handler.setFormatter(fmt)
+
+    debug_handler = logging.FileHandler(debug_path, encoding="utf-8")
+    debug_handler.setLevel(logging.DEBUG)
+    debug_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(getattr(logging, console_level.upper(), logging.INFO))
+    console_handler.setFormatter(fmt)
+
+    LOG.handlers.clear()
+    LOG.setLevel(logging.DEBUG)
+    LOG.propagate = False
+    LOG.addHandler(info_handler)
+    LOG.addHandler(debug_handler)
+    LOG.addHandler(console_handler)
+
+    QT_LOG.handlers.clear()
+    QT_LOG.setLevel(logging.DEBUG)
+    QT_LOG.propagate = False
+    QT_LOG.addHandler(debug_handler)
+
+    LOG.info("Logging initialized (console=%s)", console_level.upper())
+    LOG.info("Info log: %s", info_path)
+    LOG.debug("Debug log: %s", debug_path)
+
+
+def qt_message_handler(msg_type, context, message):
+    file_part = context.file if context is not None and context.file else "?"
+    line_part = context.line if context is not None else 0
+    func_part = context.function if context is not None and context.function else "?"
+    text = f"{message} | {file_part}:{line_part} | {func_part}"
+    if msg_type == QtMsgType.QtDebugMsg:
+        QT_LOG.debug(text)
+    elif msg_type == QtMsgType.QtInfoMsg:
+        QT_LOG.debug("INFO: %s", text)
+    elif msg_type == QtMsgType.QtWarningMsg:
+        QT_LOG.debug("WARNING: %s", text)
+    elif msg_type == QtMsgType.QtCriticalMsg:
+        QT_LOG.debug("CRITICAL: %s", text)
+    else:
+        QT_LOG.debug("FATAL: %s", text)
 
 
 def find_default_input(search_dir: Path) -> Optional[Path]:
@@ -131,14 +194,25 @@ def build_base_background_mask(L: np.ndarray):
         | (local_contrast > contrast_thresh)
         | (edge_map > edge_thresh)
     )
-    foreground_seed = morphology.remove_small_objects(foreground_seed, min_size=128)
+    # Preserve old strict behavior (< threshold) when switching to max_size (<= threshold).
+    foreground_seed = morphology.remove_small_objects(foreground_seed, max_size=127)
 
-    foreground_expanded = morphology.binary_dilation(foreground_seed, morphology.disk(10))
+    foreground_expanded = morphology.dilation(foreground_seed, morphology.disk(10))
     background_mask = ~foreground_expanded
-    background_mask = morphology.remove_small_objects(background_mask, min_size=512)
-    background_mask = morphology.remove_small_holes(background_mask, area_threshold=2048)
+    background_mask = morphology.remove_small_objects(background_mask, max_size=511)
+    background_mask = morphology.remove_small_holes(background_mask, max_size=2047)
 
-    return background_mask.astype(bool), L_norm.astype(np.float32)
+    stats = {
+        "median_L_norm": float(l_med),
+        "mad_L_norm": float(l_mad),
+        "bright_thresh": float(bright_thresh),
+        "dark_thresh": float(dark_thresh),
+        "contrast_thresh": float(contrast_thresh),
+        "edge_thresh": float(edge_thresh),
+        "background_ratio_pct": float(np.mean(background_mask) * 100.0),
+    }
+
+    return background_mask.astype(bool), L_norm.astype(np.float32), stats
 
 
 def rgb_to_qpixmap(rgb: np.ndarray, width: int, height: int) -> QPixmap:
@@ -192,7 +266,8 @@ class CurveWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(260, 130)
+        self.setMinimumSize(260, 260)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._xs = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
         self._ys = self._xs.copy()
         self._active_idx = -1
@@ -311,7 +386,6 @@ class MaskWorker(QObject):
         self,
         revision: int,
         L_norm: np.ndarray,
-        base_background_mask: np.ndarray,
         curve_xs: np.ndarray,
         curve_ys: np.ndarray,
         invert_output: bool,
@@ -320,7 +394,6 @@ class MaskWorker(QObject):
         super().__init__()
         self.revision = revision
         self.L_norm = L_norm
-        self.base_background_mask = base_background_mask
         self.curve_xs = curve_xs
         self.curve_ys = curve_ys
         self.invert_output = invert_output
@@ -336,14 +409,8 @@ class MaskWorker(QObject):
 
             if scale < 0.999:
                 L_work = ndi.zoom(self.L_norm, scale, order=1).astype(np.float32)
-                base_mask_work = ndi.zoom(
-                    self.base_background_mask.astype(np.float32),
-                    scale,
-                    order=0,
-                ) > 0.5
             else:
                 L_work = self.L_norm
-                base_mask_work = self.base_background_mask
 
             range_soft = np.interp(L_work, self.curve_xs, self.curve_ys).astype(np.float32)
             if self.invert_output:
@@ -354,9 +421,7 @@ class MaskWorker(QObject):
                 range_soft = filters.gaussian(range_soft, sigma=sigma, preserve_range=True)
 
             range_soft = clamp01(range_soft).astype(np.float32)
-            working_mask = base_mask_work & (range_soft > 0.15)
-            if not np.any(working_mask):
-                working_mask = base_mask_work.copy()
+            working_mask = np.ones_like(range_soft, dtype=bool)
 
             if scale < 0.999:
                 zoom_back = (h / float(range_soft.shape[0]), w / float(range_soft.shape[1]))
@@ -371,6 +436,10 @@ class MaskWorker(QObject):
                     "revision": self.revision,
                     "range_soft": range_soft,
                     "working_mask": working_mask.astype(bool),
+                    "range_min": float(np.min(range_soft)),
+                    "range_max": float(np.max(range_soft)),
+                    "range_mean": float(np.mean(range_soft)),
+                    "working_mask_pct": float(np.mean(working_mask) * 100.0),
                     "elapsed": time.perf_counter() - t0,
                 }
             )
@@ -419,6 +488,24 @@ class FieldsWorker(QObject):
             BY_lo = b_lo - robust_center(b_lo, self.working_mask)
             BY_hi = b_hi - robust_center(b_hi, self.working_mask)
 
+            def masked_corr(x, y, mask):
+                xv = x[mask].astype(np.float64)
+                yv = y[mask].astype(np.float64)
+                xv -= xv.mean()
+                yv -= yv.mean()
+                denom = np.linalg.norm(xv) * np.linalg.norm(yv) + 1e-12
+                return float(np.dot(xv, yv) / denom)
+
+            rg_corr = masked_corr(RG_lo, RG_hi, self.working_mask)
+            by_corr = masked_corr(BY_lo, BY_hi, self.working_mask)
+            thr = np.percentile(np.abs(RG_lo[self.working_mask]), 25)
+            valid_rg = self.working_mask & (np.abs(RG_lo) >= thr)
+            rg_sign_agree = (
+                float(np.mean(np.sign(RG_lo[valid_rg]) == np.sign(RG_hi[valid_rg])) * 100.0)
+                if np.any(valid_rg)
+                else float("nan")
+            )
+
             w_lo = 0.85
             w_hi = 0.15
             RG_field = (w_lo * RG_lo + w_hi * RG_hi).astype(np.float32)
@@ -430,10 +517,11 @@ class FieldsWorker(QObject):
 
             support_mix = w_lo * den_lo + w_hi * den_hi
             support_conf = clamp01((support_mix - 0.15) / 0.85).astype(np.float32)
+            mask_apply = (1.0 - self.range_soft).astype(np.float32)
 
             apply_alpha = np.where(
                 self.working_mask,
-                edge_falloff * support_conf * self.range_soft,
+                edge_falloff * support_conf * mask_apply,
                 0.0,
             ).astype(np.float32)
 
@@ -447,6 +535,14 @@ class FieldsWorker(QObject):
                     "BY_field": BY_field,
                     "apply_alpha": apply_alpha,
                     "coverage": float(np.mean(apply_alpha > 0.5) * 100.0),
+                    "rg_sign": rg_sign,
+                    "rg_corr": rg_corr,
+                    "by_corr": by_corr,
+                    "rg_sign_agree_pct": rg_sign_agree,
+                    "rg_std_lo": float(np.std(RG_lo[self.working_mask])),
+                    "by_std_lo": float(np.std(BY_lo[self.working_mask])),
+                    "rg_std_hi": float(np.std(RG_hi[self.working_mask])),
+                    "by_std_hi": float(np.std(BY_hi[self.working_mask])),
                     "elapsed": elapsed,
                 }
             )
@@ -491,7 +587,25 @@ class CorrectionWorker(QObject):
             lab_corr[..., 2] = b_corr
 
             rgb_corr = clamp01(color.lab2rgb(lab_corr).astype(np.float32))
-            self.finished.emit({"rgb_corr": rgb_corr, "elapsed": time.perf_counter() - t0})
+
+            def robust_sigma(x, eps=1e-6):
+                med = np.median(x)
+                mad = np.median(np.abs(x - med)) + eps
+                return float(1.4826 * mad)
+
+            delta_a = robust_sigma((self.RG_field * self.apply_alpha).ravel())
+            delta_b = robust_sigma((self.BY_field * self.apply_alpha).ravel())
+
+            self.finished.emit(
+                {
+                    "rgb_corr": rgb_corr,
+                    "elapsed": time.perf_counter() - t0,
+                    "delta_rg_sigma": delta_a,
+                    "delta_by_sigma": delta_b,
+                    "rg_k": float(self.rg_k),
+                    "by_k": float(self.by_k),
+                }
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -504,6 +618,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.pipeline: Optional[PipelineData] = None
         self.current_corrected_rgb: Optional[np.ndarray] = None
+        self.base_mask_stats = {}
 
         self.mask_ready = False
         self.mask_running = False
@@ -524,6 +639,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self._build_ui()
         self._init_paths(args.input, args.output)
+        LOG.info("UI initialized")
 
     def _build_ui(self):
         central = QWidget()
@@ -644,6 +760,7 @@ class BlotchEqualizerWindow(QMainWindow):
         g.addWidget(blur_row)
 
         lay.addWidget(box)
+        lay.setStretch(0, 1)
         lay.addStretch(1)
 
         self.toolbox.addItem(page, "2. Mask Controls")
@@ -753,14 +870,17 @@ class BlotchEqualizerWindow(QMainWindow):
 
     def status(self, text: str):
         self.statusBar().showMessage(text)
+        LOG.info("STATUS | %s", text)
 
     def show_error(self, message: str):
+        LOG.error(message)
         QMessageBox.critical(self, "Error", message)
         self.status(message)
 
     def _init_paths(self, input_arg: str, output_arg: str):
         input_path = Path(input_arg).expanduser().resolve() if input_arg else find_default_input(Path.cwd())
         if input_path is None:
+            LOG.info("No default 16-bit TIFF found in %s", Path.cwd())
             self.status("No 16-bit TIFF found. Select source file.")
             self.toolbox.setCurrentIndex(0)
             self.on_step_changed(0)
@@ -769,6 +889,8 @@ class BlotchEqualizerWindow(QMainWindow):
         self.input_edit.setText(str(input_path))
         out = Path(output_arg).expanduser().resolve() if output_arg else default_output_path(input_path)
         self.output_edit.setText(str(out))
+        LOG.info("Default input candidate: %s", input_path)
+        LOG.info("Default output candidate: %s", out)
 
         self.original_view.set_placeholder("Select input and press Load.")
         self.mask_view.set_placeholder("Load source first.")
@@ -791,6 +913,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.current_corrected_rgb = None
 
     def load_input(self, path: Path):
+        LOG.info("Loading input file: %s", path)
         try:
             rgb_raw = imread(path)
         except Exception as exc:
@@ -812,7 +935,8 @@ class BlotchEqualizerWindow(QMainWindow):
         a = lab[..., 1]
         b = lab[..., 2]
 
-        base_background_mask, L_norm = build_base_background_mask(L)
+        base_background_mask, L_norm, base_stats = build_base_background_mask(L)
+        self.base_mask_stats = base_stats
 
         self.pipeline = PipelineData(
             input_path=path,
@@ -837,10 +961,33 @@ class BlotchEqualizerWindow(QMainWindow):
         self.update_original_view()
         self.request_mask_recompute()
 
+        LOG.info("Loaded: %s", path)
+        LOG.info("Raw shape=%s, dtype=%s", rgb_raw.shape, rgb_raw.dtype)
+        LOG.info("L range: %.3f .. %.3f", float(np.min(L)), float(np.max(L)))
+        LOG.info("a range: %.3f .. %.3f", float(np.min(a)), float(np.max(a)))
+        LOG.info("b range: %.3f .. %.3f", float(np.min(b)), float(np.max(b)))
+        LOG.info(
+            "median(L)=%.4f, MAD=%.4f",
+            base_stats["median_L_norm"],
+            base_stats["mad_L_norm"],
+        )
+        LOG.info(
+            "bright_thresh=%.4f, dark_thresh=%.4f",
+            base_stats["bright_thresh"],
+            base_stats["dark_thresh"],
+        )
+        LOG.info(
+            "contrast_thresh=%.4f, edge_thresh=%.4f",
+            base_stats["contrast_thresh"],
+            base_stats["edge_thresh"],
+        )
+        LOG.info("background pixels: %.2f%%", base_stats["background_ratio_pct"])
+
         self.status(f"Loaded: {path.name} | shape={rgb_raw.shape} | dtype={rgb_raw.dtype}")
 
     def on_browse_input(self):
         current = self.input_edit.text().strip() or str(Path.cwd())
+        LOG.debug("Browse input from: %s", current)
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select 16-bit TIFF",
@@ -850,6 +997,7 @@ class BlotchEqualizerWindow(QMainWindow):
         if not path:
             return
         self.input_edit.setText(path)
+        LOG.info("Input selected via dialog: %s", path)
         self.on_input_changed()
 
     def on_input_changed(self):
@@ -863,6 +1011,8 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.input_edit.setText(str(path))
         self.output_edit.setText(str(default_output_path(path)))
+        LOG.info("Input path set: %s", path)
+        LOG.info("Output path auto-set: %s", self.output_edit.text().strip())
         self.status("Input path updated. Press Load.")
 
     def on_load_clicked(self):
@@ -879,6 +1029,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
     def on_browse_output(self):
         current = self.output_edit.text().strip() or str(Path.cwd() / "output_equalized.tiff")
+        LOG.debug("Browse output from: %s", current)
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Select output TIFF",
@@ -887,6 +1038,7 @@ class BlotchEqualizerWindow(QMainWindow):
         )
         if path:
             self.output_edit.setText(path)
+            LOG.info("Output selected via dialog: %s", path)
 
     def on_reset_curve(self):
         self.curve.reset_curve()
@@ -895,19 +1047,35 @@ class BlotchEqualizerWindow(QMainWindow):
         self.range_blur_value.setText(str(value))
         self.on_mask_controls_changed()
 
+    def on_mask_threshold_changed(self, value: int):
+        self.mask_threshold_value.setText(f"{value / 100.0:.2f}")
+        self.on_mask_controls_changed()
+
     def on_mask_controls_changed(self, *_):
         if self.pipeline is None:
             return
+        LOG.debug(
+            "Mask controls changed: invert=%s, blur=%s, threshold=%.2f",
+            self.invert_check.isChecked(),
+            self.range_blur_slider.value(),
+            self.mask_threshold_slider.value() / 100.0,
+        )
         self.request_mask_recompute()
 
     def on_sigma_changed(self, value: int):
         self.sigma_value.setText(str(value))
         self.invalidate_fields()
+        LOG.info("Field sigma slider changed: sigma_lo=%d sigma_hi=%d", value, value * 2)
         self.status("Gaussian tile size changed. RG/BY fields need new Preview.")
 
     def on_strength_changed(self):
         self.rg_strength_value.setText(str(self.rg_strength_slider.value()))
         self.by_strength_value.setText(str(self.by_strength_slider.value()))
+        LOG.info(
+            "Correction strengths changed: RG=%d%% BY=%d%%",
+            self.rg_strength_slider.value(),
+            self.by_strength_slider.value(),
+        )
         self.current_corrected_rgb = None
         self.corrected_view.set_placeholder("Press Preview to update corrected image.")
 
@@ -928,16 +1096,26 @@ class BlotchEqualizerWindow(QMainWindow):
         xs, ys = self.curve.control_points()
         invert_output = self.invert_check.isChecked()
         blur_radius = float(self.range_blur_slider.value())
+        mask_threshold = float(self.mask_threshold_slider.value()) / 100.0
+        LOG.info(
+            "Mask recompute request #%d | invert=%s | blur=%.2f | threshold=%.2f | curve_ys=%s",
+            revision,
+            invert_output,
+            blur_radius,
+            mask_threshold,
+            np.array2string(ys, precision=3),
+        )
 
         self.mask_thread = QThread(self)
+        self.mask_thread.setObjectName("mask_worker")
         self.mask_worker = MaskWorker(
             revision=revision,
             L_norm=p.L_norm.copy(),
-            base_background_mask=p.base_background_mask.copy(),
             curve_xs=xs,
             curve_ys=ys,
             invert_output=invert_output,
             blur_radius=blur_radius,
+            mask_threshold=mask_threshold,
         )
         self.mask_worker.moveToThread(self.mask_thread)
 
@@ -972,7 +1150,18 @@ class BlotchEqualizerWindow(QMainWindow):
         if self.toolbox.currentIndex() == 1:
             self.update_mask_view()
 
+        LOG.info(
+            "Mask result #%d | elapsed=%.2fs | range[min/max/mean]=%.4f/%.4f/%.4f | mask=%.2f%%",
+            result["revision"],
+            result["elapsed"],
+            result["range_min"],
+            result["range_max"],
+            result["range_mean"],
+            result["working_mask_pct"],
+        )
         self.status(f"Mask updated in {result['elapsed']:.1f}s. RG/BY fields need new Preview.")
+        if not np.any(self.pipeline.working_mask):
+            self.status("Mask updated, but working mask is empty. Lower threshold or change curve.")
 
         if self.mask_revision > result["revision"]:
             self.request_mask_recompute()
@@ -1011,8 +1200,16 @@ class BlotchEqualizerWindow(QMainWindow):
 
         rev = self.fields_revision
         sigma_lo = int(self.sigma_slider.value())
+        LOG.info(
+            "Fields preview start | revision=%d | sigma_lo=%d sigma_hi=%d | mask=%.2f%%",
+            rev,
+            sigma_lo,
+            sigma_lo * 2,
+            float(np.mean(p.working_mask) * 100.0),
+        )
 
         self.fields_thread = QThread(self)
+        self.fields_thread.setObjectName("fields_worker")
         self.fields_worker = FieldsWorker(
             revision=rev,
             a=p.a,
@@ -1053,6 +1250,32 @@ class BlotchEqualizerWindow(QMainWindow):
         self.fields_ready = True
         self.current_corrected_rgb = None
 
+        LOG.info("RG axis sign convention: rg_sign=%+.0f", result["rg_sign"])
+        LOG.info(
+            "RG corr(%d,%d)=%.4f, RG sign agreement=%.2f%%",
+            result["sigma_lo"],
+            result["sigma_hi"],
+            result["rg_corr"],
+            result["rg_sign_agree_pct"],
+        )
+        LOG.info(
+            "BY corr(%d,%d)=%.4f",
+            result["sigma_lo"],
+            result["sigma_hi"],
+            result["by_corr"],
+        )
+        LOG.info(
+            "Scale-space debug: sigma=%d std(RG)=%.4f std(BY)=%.4f | sigma=%d std(RG)=%.4f std(BY)=%.4f",
+            result["sigma_lo"],
+            result["rg_std_lo"],
+            result["by_std_lo"],
+            result["sigma_hi"],
+            result["rg_std_hi"],
+            result["by_std_hi"],
+        )
+        LOG.info("field blend: w32=0.85, w64=0.15")
+        LOG.info("apply_alpha coverage (>0.5): %.2f%%", result["coverage"])
+
         self.status(
             f"Fields ready in {result['elapsed']:.1f}s | "
             f"sigma={result['sigma_lo']}/{result['sigma_hi']} | "
@@ -1064,6 +1287,7 @@ class BlotchEqualizerWindow(QMainWindow):
     def on_fields_failed(self, message: str):
         self.fields_running = False
         self.fields_preview_btn.setEnabled(True)
+        LOG.error("Field calculation failed: %s", message)
         self.show_error(f"Field calculation failed: {message}")
 
     def cleanup_fields_worker(self, *_):
@@ -1093,8 +1317,15 @@ class BlotchEqualizerWindow(QMainWindow):
         rg_k = float(self.rg_strength_slider.value()) / 100.0
         by_k = float(self.by_strength_slider.value()) / 100.0
         p = self.pipeline
+        LOG.info(
+            "Correction preview start | RG=%.2f BY=%.2f | fields_ready=%s",
+            rg_k,
+            by_k,
+            self.fields_ready,
+        )
 
         self.corr_thread = QThread(self)
+        self.corr_thread.setObjectName("correction_worker")
         self.corr_worker = CorrectionWorker(
             lab=p.lab.copy(),
             a=p.a.copy(),
@@ -1127,12 +1358,21 @@ class BlotchEqualizerWindow(QMainWindow):
         self.current_corrected_rgb = result["rgb_corr"]
         if self.toolbox.currentIndex() in (3, 4):
             self.update_corrected_view()
+        LOG.info(
+            "Correction preview done | elapsed=%.2fs | delta_rg_sigma=%.4f | delta_by_sigma=%.4f | RG=%.2f | BY=%.2f",
+            result["elapsed"],
+            result["delta_rg_sigma"],
+            result["delta_by_sigma"],
+            result["rg_k"],
+            result["by_k"],
+        )
         self.status(f"Correction preview ready in {result['elapsed']:.2f}s")
 
     @pyqtSlot(str)
     def on_correction_failed(self, message: str):
         self.correction_running = False
         self.correction_preview_btn.setEnabled(True)
+        LOG.error("Correction preview failed: %s", message)
         self.show_error(f"Correction preview failed: {message}")
 
     def cleanup_correction_worker(self, *_):
@@ -1172,12 +1412,16 @@ class BlotchEqualizerWindow(QMainWindow):
                 self.output_edit.setText(str(out_path))
 
             saved = self.save_tiff(rgb_corr, out_path)
+            LOG.info("Saved output TIFF: %s", saved)
+            LOG.info("Saved shape=%s dtype=%s", rgb_corr.shape, np.uint16)
             self.status(f"Saved: {saved}")
             QMessageBox.information(self, "Saved", f"Saved: {saved}")
         except Exception as exc:
+            LOG.exception("Save failed")
             self.show_error(f"Save failed: {exc}")
 
     def on_step_changed(self, idx: int):
+        LOG.debug("Step changed: %d", idx + 1)
         self.original_view.setVisible(False)
         self.mask_view.setVisible(False)
         self.fields_container.setVisible(False)
@@ -1208,12 +1452,10 @@ class BlotchEqualizerWindow(QMainWindow):
             return
 
         soft = self.pipeline.range_soft
-        mask = self.pipeline.working_mask
-        mask_rgb = np.zeros((soft.shape[0], soft.shape[1], 3), dtype=np.float32)
-        mask_rgb[..., 1] = soft
-        mask_rgb[..., 0] = soft * 0.35
-        mask_rgb[..., 2] = 1.0 - soft
-        mask_rgb = np.where(mask[..., None], mask_rgb, np.array([0.07, 0.07, 0.07], dtype=np.float32))
+
+        # Show soft grayscale mask driven by curve settings over the whole image.
+        gray = soft.astype(np.float32)
+        mask_rgb = np.repeat(gray[..., None], 3, axis=2)
         self.mask_view.set_image(mask_rgb)
 
     def update_fields_view(self):
@@ -1255,8 +1497,10 @@ class BlotchEqualizerWindow(QMainWindow):
         for thr in (self.mask_thread, self.fields_thread, self.corr_thread):
             if thr is not None and thr.isRunning():
                 self.status("Waiting for background calculations to finish...")
+                LOG.info("Waiting for active thread to finish: %s", thr.objectName() or "worker")
                 thr.quit()
                 thr.wait()
+        LOG.info("Application close")
         super().closeEvent(event)
 
 
@@ -1264,11 +1508,23 @@ def parse_args(argv: list[str]):
     parser = argparse.ArgumentParser(description="Standalone blotch equalizer (RG/BY background field correction)")
     parser.add_argument("--input", default="", help="Input 16-bit TIFF")
     parser.add_argument("--output", default="", help="Output TIFF path")
+    parser.add_argument("--log-dir", default="logs", help="Directory for info/debug logs")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Console log level (file logs stay info/debug).",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    setup_logging(Path(args.log_dir).expanduser().resolve(), console_level=args.log_level)
+    qInstallMessageHandler(qt_message_handler)
+    LOG.info("Application start")
+    LOG.info("CWD: %s", Path.cwd())
+    LOG.info("Args: input=%s output=%s log_dir=%s", args.input, args.output, args.log_dir)
     app = QApplication(sys.argv)
     win = BlotchEqualizerWindow(args)
     win.show()
