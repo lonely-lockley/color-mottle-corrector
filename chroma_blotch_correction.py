@@ -228,6 +228,39 @@ def quick_l_norm(L: np.ndarray) -> np.ndarray:
     return clamp01((L - L_low) / (L_high - L_low + 1e-8)).astype(np.float32)
 
 
+def prepare_mask_work_luminance(L_norm: np.ndarray, max_dim: int = 2200):
+    h, w = L_norm.shape
+    max_side = max(h, w)
+    scale = min(1.0, float(max_dim) / float(max_side))
+    if scale < 0.999:
+        L_work = ndi.zoom(L_norm, scale, order=1).astype(np.float32)
+    else:
+        L_work = L_norm.astype(np.float32, copy=False)
+        scale = 1.0
+    return L_work, float(scale)
+
+
+def fit_array_to_shape(arr: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    h, w = shape
+    ah, aw = arr.shape
+    if (ah, aw) == (h, w):
+        return arr.astype(np.float32, copy=False)
+
+    out = np.empty((h, w), dtype=np.float32)
+    hh = min(h, ah)
+    ww = min(w, aw)
+    out[:hh, :ww] = arr[:hh, :ww]
+
+    if hh < h:
+        out[hh:, :ww] = out[hh - 1 : hh, :ww]
+    if ww < w:
+        out[:hh, ww:] = out[:hh, ww - 1 : ww]
+    if hh < h and ww < w:
+        out[hh:, ww:] = out[hh - 1, ww - 1]
+
+    return out
+
+
 def rgb_to_qpixmap(rgb: np.ndarray, width: int, height: int) -> QPixmap:
     rgb8 = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
     h, w, _ = rgb8.shape
@@ -473,6 +506,8 @@ class MaskWorker(QObject):
         curve_ys: np.ndarray,
         invert_output: bool,
         blur_radius: float,
+        prepared_L_work: Optional[np.ndarray] = None,
+        prepared_scale: float = 1.0,
     ):
         super().__init__()
         self.revision = revision
@@ -481,38 +516,53 @@ class MaskWorker(QObject):
         self.curve_ys = curve_ys
         self.invert_output = invert_output
         self.blur_radius = blur_radius
+        self.prepared_L_work = prepared_L_work
+        self.prepared_scale = prepared_scale
 
     @pyqtSlot()
     def run(self):
         t0 = time.perf_counter()
         try:
             h, w = self.L_norm.shape
-            max_dim = max(h, w)
-            scale = min(1.0, 2200.0 / float(max_dim))
 
-            if scale < 0.999:
-                L_work = ndi.zoom(self.L_norm, scale, order=1).astype(np.float32)
+            t_prep = time.perf_counter()
+            cache_used = self.prepared_L_work is not None
+            cache_generated = False
+            if cache_used:
+                L_work = self.prepared_L_work
+                scale = float(self.prepared_scale)
             else:
-                L_work = self.L_norm
+                L_work, scale = prepare_mask_work_luminance(self.L_norm)
+                cache_generated = scale < 0.999
+            prep_elapsed = time.perf_counter() - t_prep
 
-            range_soft = np.interp(L_work, self.curve_xs, self.curve_ys).astype(np.float32)
+            t_curve = time.perf_counter()
+            lut_size = 4096
+            lut_x = np.linspace(0.0, 1.0, lut_size, dtype=np.float32)
+            lut_y = np.interp(lut_x, self.curve_xs, self.curve_ys).astype(np.float32)
+            lut_idx = np.clip((L_work * (lut_size - 1)).astype(np.int32), 0, lut_size - 1)
+            range_soft = lut_y[lut_idx]
             if self.invert_output:
                 range_soft = 1.0 - range_soft
+            curve_elapsed = time.perf_counter() - t_curve
 
+            t_blur = time.perf_counter()
             if self.blur_radius > 0:
                 sigma = self.blur_radius * scale
-                range_soft = filters.gaussian(range_soft, sigma=sigma, preserve_range=True)
+                if sigma > 1e-3:
+                    range_soft = ndi.gaussian_filter(range_soft, sigma=sigma, mode="nearest")
+            blur_elapsed = time.perf_counter() - t_blur
 
             range_soft = clamp01(range_soft).astype(np.float32)
-            working_mask = np.ones_like(range_soft, dtype=bool)
 
+            t_up = time.perf_counter()
             if scale < 0.999:
                 zoom_back = (h / float(range_soft.shape[0]), w / float(range_soft.shape[1]))
                 range_soft = ndi.zoom(range_soft, zoom_back, order=1).astype(np.float32)
-                range_soft = range_soft[:h, :w]
+                range_soft = fit_array_to_shape(range_soft, (h, w))
+            up_elapsed = time.perf_counter() - t_up
 
-                working_mask = ndi.zoom(working_mask.astype(np.float32), zoom_back, order=0) > 0.5
-                working_mask = working_mask[:h, :w]
+            working_mask = np.ones((h, w), dtype=bool)
 
             self.finished.emit(
                 {
@@ -523,6 +573,16 @@ class MaskWorker(QObject):
                     "range_max": float(np.max(range_soft)),
                     "range_mean": float(np.mean(range_soft)),
                     "working_mask_pct": float(np.mean(working_mask) * 100.0),
+                    "mask_scale": float(scale),
+                    "work_shape": tuple(int(v) for v in L_work.shape),
+                    "cache_used": bool(cache_used),
+                    "cache_generated": bool(cache_generated),
+                    "prepared_L_work": L_work if cache_generated else None,
+                    "prepared_scale": float(scale if cache_generated else 1.0),
+                    "prep_elapsed": float(prep_elapsed),
+                    "curve_elapsed": float(curve_elapsed),
+                    "blur_elapsed": float(blur_elapsed),
+                    "up_elapsed": float(up_elapsed),
                     "elapsed": time.perf_counter() - t0,
                 }
             )
@@ -755,6 +815,9 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_apply_pending = False
         self.mask_queue_notified = False
         self.auto_open_step2_after_mask = False
+        self.mask_prepared_L_work: Optional[np.ndarray] = None
+        self.mask_prepared_scale: float = 1.0
+        self.mask_prepared_src_shape: Optional[tuple[int, int]] = None
 
         self.fields_ready = False
         self.fields_preview_available = False
@@ -1228,6 +1291,9 @@ class BlotchEqualizerWindow(QMainWindow):
         )
 
         self.mask_ready = False
+        self.mask_prepared_L_work = None
+        self.mask_prepared_scale = 1.0
+        self.mask_prepared_src_shape = None
         self.fields_preview_available = False
         self.correction_preview_available = False
         self.correction_ready = False
@@ -1438,11 +1504,16 @@ class BlotchEqualizerWindow(QMainWindow):
         xs, ys = self.curve.control_points()
         invert_output = self.invert_check.isChecked()
         blur_radius = float(self.range_blur_slider.value())
+        use_mask_cache = (
+            self.mask_prepared_L_work is not None
+            and self.mask_prepared_src_shape == p.L_norm.shape
+        )
         LOG.info(
-            "Mask recompute request #%d | invert=%s | blur=%.2f | curve_ys=%s",
+            "Mask recompute request #%d | invert=%s | blur=%.2f | cache=%s | curve_ys=%s",
             revision,
             invert_output,
             blur_radius,
+            "hit" if use_mask_cache else "miss",
             np.array2string(ys, precision=3),
         )
 
@@ -1451,11 +1522,13 @@ class BlotchEqualizerWindow(QMainWindow):
         self._register_thread(self.mask_thread)
         self.mask_worker = MaskWorker(
             revision=revision,
-            L_norm=p.L_norm.copy(),
+            L_norm=p.L_norm,
             curve_xs=xs,
             curve_ys=ys,
             invert_output=invert_output,
             blur_radius=blur_radius,
+            prepared_L_work=self.mask_prepared_L_work if use_mask_cache else None,
+            prepared_scale=self.mask_prepared_scale if use_mask_cache else 1.0,
         )
         self.mask_worker.moveToThread(self.mask_thread)
 
@@ -1488,13 +1561,31 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_ready = True
         self.invalidate_fields()
 
+        if result.get("cache_generated") and isinstance(result.get("prepared_L_work"), np.ndarray):
+            self.mask_prepared_L_work = result["prepared_L_work"]
+            self.mask_prepared_scale = float(result.get("prepared_scale", 1.0))
+            self.mask_prepared_src_shape = self.pipeline.L_norm.shape
+            LOG.info(
+                "Mask cache prepared: work_shape=%s scale=%.4f",
+                result.get("work_shape"),
+                self.mask_prepared_scale,
+            )
+
         if self.toolbox.currentIndex() == 1:
             self.update_mask_view()
 
         LOG.info(
-            "Mask result #%d | elapsed=%.2fs | range[min/max/mean]=%.4f/%.4f/%.4f | mask=%.2f%%",
+            "Mask result #%d | elapsed=%.2fs | prep=%.3fs curve=%.3fs blur=%.3fs up=%.3fs | "
+            "scale=%.4f work_shape=%s cache_used=%s | range[min/max/mean]=%.4f/%.4f/%.4f | mask=%.2f%%",
             result["revision"],
             result["elapsed"],
+            result.get("prep_elapsed", 0.0),
+            result.get("curve_elapsed", 0.0),
+            result.get("blur_elapsed", 0.0),
+            result.get("up_elapsed", 0.0),
+            result.get("mask_scale", 1.0),
+            result.get("work_shape"),
+            result.get("cache_used", False),
             result["range_min"],
             result["range_max"],
             result["range_mean"],
