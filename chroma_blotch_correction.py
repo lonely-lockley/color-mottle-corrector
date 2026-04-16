@@ -627,7 +627,7 @@ class FieldsWorker(QObject):
             emit_progress(5, f"Preparing scales sigma={self.sigma_lo}/{sigma_hi}")
 
             workers = choose_blur_workers(4)
-            emit_progress(8, f"Starting parallel blur jobs ({workers} workers)")
+            emit_progress(8, f"Starting parallel field calculation jobs ({workers} workers)")
             blur_jobs = [
                 ("a_lo", self.a, self.sigma_lo, f"Blur A @ sigma={self.sigma_lo}"),
                 ("b_lo", self.b, self.sigma_lo, f"Blur B @ sigma={self.sigma_lo}"),
