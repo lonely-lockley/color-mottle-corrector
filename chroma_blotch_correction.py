@@ -1342,8 +1342,9 @@ class BlotchEqualizerWindow(QMainWindow):
         page = QWidget()
         lay = QVBoxLayout(page)
 
-        box = QGroupBox("Range Mask Controls")
-        g = QVBoxLayout(box)
+        controls = QWidget()
+        g = QVBoxLayout(controls)
+        g.setContentsMargins(0, 0, 0, 0)
 
         self.curve = CurveWidget()
         self.reset_curve_btn = QPushButton("Reset Curve")
@@ -1368,8 +1369,9 @@ class BlotchEqualizerWindow(QMainWindow):
         g.addWidget(self.apply_mask_btn)
         self._style_primary_action_button(self.apply_mask_btn)
 
-        lay.addWidget(box)
-        lay.setStretch(0, 1)
+        lay.addWidget(QLabel("Range Mask Controls"))
+        lay.addWidget(controls)
+        lay.setAlignment(Qt.AlignmentFlag.AlignTop)
         lay.addStretch(1)
 
         self.toolbox.addItem(page, self.step_titles[1])
