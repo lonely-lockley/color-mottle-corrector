@@ -450,6 +450,7 @@ class MaskWorker(QObject):
 class FieldsWorker(QObject):
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
+    progress = pyqtSignal(int, str)
 
     def __init__(
         self,
@@ -471,17 +472,27 @@ class FieldsWorker(QObject):
     @pyqtSlot()
     def run(self):
         t0 = time.perf_counter()
+        def emit_progress(percent: int, text: str):
+            self.progress.emit(int(np.clip(percent, 0, 100)), text)
+
         try:
+            emit_progress(2, "Validating mask")
             if not np.any(self.working_mask):
                 raise RuntimeError("Background mask is empty. Tune mask controls first.")
 
             sigma_hi = self.sigma_lo * 2
+            emit_progress(5, f"Preparing scales sigma={self.sigma_lo}/{sigma_hi}")
 
+            emit_progress(14, f"Blur A @ sigma={self.sigma_lo}")
             a_lo, den_lo = masked_normalized_blur(self.a, self.working_mask, self.sigma_lo)
+            emit_progress(28, f"Blur B @ sigma={self.sigma_lo}")
             b_lo, _ = masked_normalized_blur(self.b, self.working_mask, self.sigma_lo)
+            emit_progress(42, f"Blur A @ sigma={sigma_hi}")
             a_hi, den_hi = masked_normalized_blur(self.a, self.working_mask, sigma_hi)
+            emit_progress(56, f"Blur B @ sigma={sigma_hi}")
             b_hi, _ = masked_normalized_blur(self.b, self.working_mask, sigma_hi)
 
+            emit_progress(68, "Centering RG/BY components")
             rg_sign = 1.0
             RG_lo = rg_sign * (a_lo - robust_center(a_lo, self.working_mask))
             RG_hi = rg_sign * (a_hi - robust_center(a_hi, self.working_mask))
@@ -496,6 +507,7 @@ class FieldsWorker(QObject):
                 denom = np.linalg.norm(xv) * np.linalg.norm(yv) + 1e-12
                 return float(np.dot(xv, yv) / denom)
 
+            emit_progress(76, "Checking scale stability")
             rg_corr = masked_corr(RG_lo, RG_hi, self.working_mask)
             by_corr = masked_corr(BY_lo, BY_hi, self.working_mask)
             thr = np.percentile(np.abs(RG_lo[self.working_mask]), 25)
@@ -506,11 +518,13 @@ class FieldsWorker(QObject):
                 else float("nan")
             )
 
+            emit_progress(84, "Blending fields 32/64")
             w_lo = 0.85
             w_hi = 0.15
             RG_field = (w_lo * RG_lo + w_hi * RG_hi).astype(np.float32)
             BY_field = (w_lo * BY_lo + w_hi * BY_hi).astype(np.float32)
 
+            emit_progress(92, "Building correction alpha")
             edge_soft_px = 28.0
             bg_dist = ndi.distance_transform_edt(self.working_mask)
             edge_falloff = clamp01(bg_dist / edge_soft_px).astype(np.float32)
@@ -526,6 +540,7 @@ class FieldsWorker(QObject):
             ).astype(np.float32)
 
             elapsed = time.perf_counter() - t0
+            emit_progress(98, "Finalizing output")
             self.finished.emit(
                 {
                     "revision": self.revision,
@@ -642,10 +657,42 @@ class BlotchEqualizerWindow(QMainWindow):
         self._init_paths(args.input, args.output)
         LOG.info("UI initialized")
 
+    def _style_primary_action_button(self, button: QPushButton):
+        button.setProperty("primaryAction", True)
+        button.setMinimumHeight(44)
+        button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
     def _build_ui(self):
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(6, 6, 6, 6)
+
+        # macOS-like accent styling for primary action buttons on each step.
+        self.setStyleSheet(
+            """
+            QPushButton[primaryAction="true"] {
+                background-color: #1E88E5;
+                color: #ffffff;
+                border: 1px solid #1E88E5;
+                border-radius: 8px;
+                font-weight: 600;
+                padding: 8px 14px;
+            }
+            QPushButton[primaryAction="true"]:hover {
+                background-color: #2791EF;
+                border-color: #2791EF;
+            }
+            QPushButton[primaryAction="true"]:pressed {
+                background-color: #1976D2;
+                border-color: #1976D2;
+            }
+            QPushButton[primaryAction="true"]:disabled {
+                background-color: #84BFF1;
+                border-color: #84BFF1;
+                color: #EAF4FF;
+            }
+            """
+        )
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -720,7 +767,7 @@ class BlotchEqualizerWindow(QMainWindow):
         r.addWidget(self.input_browse_btn)
         self.input_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.input_browse_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.load_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._style_primary_action_button(self.load_btn)
 
         lay.addWidget(QLabel("Input 16-bit TIFF:"))
         lay.addWidget(row)
@@ -742,6 +789,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.curve = CurveWidget()
         self.reset_curve_btn = QPushButton("Reset Curve")
+        self.apply_mask_btn = QPushButton("Apply mask")
         self.invert_check = QCheckBox("Invert output")
 
         blur_row = QWidget()
@@ -756,9 +804,11 @@ class BlotchEqualizerWindow(QMainWindow):
         br.addWidget(self.range_blur_value)
 
         g.addWidget(self.curve)
-        g.addWidget(self.reset_curve_btn)
         g.addWidget(self.invert_check)
         g.addWidget(blur_row)
+        g.addWidget(self.reset_curve_btn)
+        g.addWidget(self.apply_mask_btn)
+        self._style_primary_action_button(self.apply_mask_btn)
 
         lay.addWidget(box)
         lay.setStretch(0, 1)
@@ -767,6 +817,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.toolbox.addItem(page, "2. Mask Controls")
 
         self.reset_curve_btn.clicked.connect(self.on_reset_curve)
+        self.apply_mask_btn.clicked.connect(self.on_apply_mask_clicked)
         self.curve.curveChanged.connect(self.on_mask_controls_changed)
         self.invert_check.stateChanged.connect(self.on_mask_controls_changed)
         self.range_blur_slider.valueChanged.connect(self.on_range_blur_changed)
@@ -793,6 +844,7 @@ class BlotchEqualizerWindow(QMainWindow):
         sr.addWidget(self.sigma_value)
 
         self.fields_preview_btn = QPushButton("Preview")
+        self._style_primary_action_button(self.fields_preview_btn)
 
         lay.addWidget(info)
         lay.addWidget(sigma_row)
@@ -833,6 +885,7 @@ class BlotchEqualizerWindow(QMainWindow):
         lay.addWidget(rg_row)
         lay.addWidget(by_row)
         self.correction_preview_btn = QPushButton("Preview")
+        self._style_primary_action_button(self.correction_preview_btn)
         lay.addWidget(self.correction_preview_btn)
         lay.addStretch(1)
 
@@ -860,7 +913,7 @@ class BlotchEqualizerWindow(QMainWindow):
         lay.addWidget(row)
 
         self.save_btn = QPushButton("Save")
-        self.save_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._style_primary_action_button(self.save_btn)
         lay.addWidget(self.save_btn)
         lay.addStretch(1)
 
@@ -1059,6 +1112,10 @@ class BlotchEqualizerWindow(QMainWindow):
     def on_reset_curve(self):
         self.curve.reset_curve()
 
+    def on_apply_mask_clicked(self):
+        LOG.info("Apply mask clicked (UI-only action).")
+        self.status("Mask settings are already applied automatically.")
+
     def on_range_blur_changed(self, value: int):
         self.range_blur_value.setText(str(value))
         self.on_mask_controls_changed()
@@ -1238,6 +1295,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.fields_thread.started.connect(self.fields_worker.run)
         self.fields_worker.finished.connect(self.on_fields_finished)
         self.fields_worker.failed.connect(self.on_fields_failed)
+        self.fields_worker.progress.connect(self.on_fields_progress)
 
         self.fields_worker.finished.connect(self.cleanup_fields_worker)
         self.fields_worker.failed.connect(self.cleanup_fields_worker)
@@ -1246,6 +1304,10 @@ class BlotchEqualizerWindow(QMainWindow):
         self.fields_preview_btn.setEnabled(False)
         self.status("Calculating RG/BY fields...")
         self.fields_thread.start()
+
+    @pyqtSlot(int, str)
+    def on_fields_progress(self, percent: int, message: str):
+        self.status(f"Calculating RG/BY fields... {percent}% | {message}")
 
     @pyqtSlot(object)
     def on_fields_finished(self, result):
