@@ -30,3 +30,8 @@ logs/
 # TIFF data (source, preview, processed)
 *.tif
 *.tiff
+
+# FITS data
+*.fit
+*.fits
+*.fts
