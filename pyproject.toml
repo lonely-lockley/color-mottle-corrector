@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chroma-blotch-corrector"
+version = "0.1.0"
+description = "Standalone chroma blotch correction tool for astrophotography"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "scipy",
+  "matplotlib",
+  "tifffile",
+  "scikit-image",
+  "PyQt6",
+]
+
+[project.optional-dependencies]
+fits = ["astropy"]
+
+[project.scripts]
+chroma-blotch-corrector = "chroma_blotch_correction:cli"
+
+[tool.setuptools]
+py-modules = ["chroma_blotch_correction"]

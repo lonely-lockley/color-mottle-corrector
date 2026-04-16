@@ -113,20 +113,8 @@ LOG = logging.getLogger(APP_LOGGER_NAME)
 QT_LOG = logging.getLogger(f"{APP_LOGGER_NAME}.qt")
 
 
-def setup_logging(log_dir: Path, console_level: str = "INFO"):
-    log_dir.mkdir(parents=True, exist_ok=True)
-    info_path = log_dir / "chroma_blotch_info.log"
-    debug_path = log_dir / "chroma_blotch_debug.log"
-
+def setup_logging(log_dir: Path, console_level: str = "INFO", file_logs: bool = False):
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-
-    info_handler = logging.FileHandler(info_path, encoding="utf-8")
-    info_handler.setLevel(logging.INFO)
-    info_handler.setFormatter(fmt)
-
-    debug_handler = logging.FileHandler(debug_path, encoding="utf-8")
-    debug_handler.setLevel(logging.DEBUG)
-    debug_handler.setFormatter(fmt)
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(getattr(logging, console_level.upper(), logging.INFO))
@@ -135,18 +123,36 @@ def setup_logging(log_dir: Path, console_level: str = "INFO"):
     LOG.handlers.clear()
     LOG.setLevel(logging.DEBUG)
     LOG.propagate = False
-    LOG.addHandler(info_handler)
-    LOG.addHandler(debug_handler)
     LOG.addHandler(console_handler)
 
     QT_LOG.handlers.clear()
     QT_LOG.setLevel(logging.DEBUG)
     QT_LOG.propagate = False
-    QT_LOG.addHandler(debug_handler)
 
-    LOG.info("Logging initialized (console=%s)", console_level.upper())
-    LOG.info("Info log: %s", info_path)
-    LOG.debug("Debug log: %s", debug_path)
+    if file_logs:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        info_path = log_dir / "chroma_blotch_info.log"
+        debug_path = log_dir / "chroma_blotch_debug.log"
+
+        info_handler = logging.FileHandler(info_path, encoding="utf-8")
+        info_handler.setLevel(logging.INFO)
+        info_handler.setFormatter(fmt)
+
+        debug_handler = logging.FileHandler(debug_path, encoding="utf-8")
+        debug_handler.setLevel(logging.DEBUG)
+        debug_handler.setFormatter(fmt)
+
+        LOG.addHandler(info_handler)
+        LOG.addHandler(debug_handler)
+        QT_LOG.addHandler(debug_handler)
+
+        LOG.info("Logging initialized (console=%s, file_logs=on)", console_level.upper())
+        LOG.info("Info log: %s", info_path)
+        LOG.debug("Debug log: %s", debug_path)
+    else:
+        # Keep Qt chatter out of console when file logs are disabled.
+        QT_LOG.addHandler(logging.NullHandler())
+        LOG.info("Logging initialized (console=%s, file_logs=off)", console_level.upper())
 
 
 def qt_message_handler(msg_type, context, message):
@@ -505,6 +511,24 @@ def heatmap_rgb(data: np.ndarray, mask: np.ndarray, cmap_name: str) -> np.ndarra
 
     bg = np.ones_like(rgb) * 0.08
     return np.where(mask[..., None], rgb, bg).astype(np.float32)
+
+
+def stretch_rgb_preview(rgb: np.ndarray) -> np.ndarray:
+    x = clamp01(rgb.astype(np.float32, copy=False))
+    if x.size == 0:
+        return x
+
+    lum = 0.2126 * x[..., 0] + 0.7152 * x[..., 1] + 0.0722 * x[..., 2]
+    low = float(np.percentile(lum, 0.5))
+    high = float(np.percentile(lum, 99.8))
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low + 1e-7:
+        return x
+
+    xn = clamp01((x - low) / (high - low + 1e-8))
+    stretch = 12.0
+    xs = np.arcsinh(xn * stretch) / np.arcsinh(stretch)
+    xs = np.power(clamp01(xs), 0.85)
+    return xs.astype(np.float32, copy=False)
 
 
 @dataclass
@@ -1039,6 +1063,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.pipeline: Optional[PipelineData] = None
         self.current_corrected_rgb: Optional[np.ndarray] = None
         self.base_mask_stats = {}
+        self.stretch_preview_enabled = False
 
         self.mask_ready = False
         self.mask_running = False
@@ -1272,6 +1297,15 @@ class BlotchEqualizerWindow(QMainWindow):
         self.right_layout = QVBoxLayout(right_panel)
         self.right_layout.setContentsMargins(0, 0, 0, 0)
 
+        self.preview_controls = QWidget()
+        pc = QHBoxLayout(self.preview_controls)
+        pc.setContentsMargins(4, 4, 4, 4)
+        self.stretch_image_check = QCheckBox("Stretch image")
+        self.stretch_image_check.setChecked(False)
+        self.stretch_image_check.toggled.connect(self.on_stretch_preview_toggled)
+        pc.addStretch(1)
+        pc.addWidget(self.stretch_image_check)
+
         self.original_view = self._make_image_label("Source image")
         self.mask_view = self._make_image_label("Mask preview")
         self.corrected_view = self._make_image_label("Corrected preview")
@@ -1291,6 +1325,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.right_layout.addWidget(self.mask_view)
         self.right_layout.addWidget(self.fields_container)
         self.right_layout.addWidget(self.corrected_view)
+        self.right_layout.addWidget(self.preview_controls)
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
@@ -1575,6 +1610,17 @@ class BlotchEqualizerWindow(QMainWindow):
     def status(self, text: str):
         self.statusBar().showMessage(text)
         LOG.info("STATUS | %s", text)
+
+    def _display_rgb(self, rgb: np.ndarray, allow_stretch: bool = True) -> np.ndarray:
+        if allow_stretch and self.stretch_preview_enabled:
+            return stretch_rgb_preview(rgb)
+        return rgb
+
+    def on_stretch_preview_toggled(self, checked: bool):
+        self.stretch_preview_enabled = bool(checked)
+        LOG.info("Preview stretch toggled: %s", self.stretch_preview_enabled)
+        self.status("Preview stretch enabled." if self.stretch_preview_enabled else "Preview stretch disabled.")
+        self.on_step_changed(self.toolbox.currentIndex())
 
     def _set_load_controls_enabled(self, enabled: bool):
         self.load_btn.setEnabled(enabled)
@@ -2411,6 +2457,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
     def on_step_changed(self, idx: int):
         LOG.debug("Step changed: %d", idx + 1)
+        self.preview_controls.setVisible(idx in (0, 3, 4))
         self.original_view.setVisible(False)
         self.mask_view.setVisible(False)
         self.fields_container.setVisible(False)
@@ -2433,7 +2480,7 @@ class BlotchEqualizerWindow(QMainWindow):
         if self.pipeline is None:
             self.original_view.set_placeholder("Source image")
             return
-        self.original_view.set_image(self.pipeline.rgb_float)
+        self.original_view.set_image(self._display_rgb(self.pipeline.rgb_float, allow_stretch=True))
 
     def update_mask_view(self):
         if self.pipeline is None:
@@ -2472,7 +2519,7 @@ class BlotchEqualizerWindow(QMainWindow):
         if not self.correction_preview_available or self.current_corrected_rgb is None:
             self.corrected_view.set_placeholder("Preview not available")
             return
-        self.corrected_view.set_image(self.current_corrected_rgb)
+        self.corrected_view.set_image(self._display_rgb(self.current_corrected_rgb, allow_stretch=True))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2509,21 +2556,36 @@ def parse_args(argv: list[str]):
     parser.add_argument("--output", default="", help="Output image path (TIFF/FITS)")
     parser.add_argument("--log-dir", default="logs", help="Directory for info/debug logs")
     parser.add_argument(
+        "--file-logs",
+        action="store_true",
+        help="Enable file logging (disabled by default).",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Console log level (file logs stay info/debug).",
+        help="Console log level.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    setup_logging(Path(args.log_dir).expanduser().resolve(), console_level=args.log_level)
+    setup_logging(
+        Path(args.log_dir).expanduser().resolve(),
+        console_level=args.log_level,
+        file_logs=bool(args.file_logs),
+    )
     qInstallMessageHandler(qt_message_handler)
     LOG.info("Application start")
     LOG.info("CWD: %s", Path.cwd())
-    LOG.info("Args: input=%s output=%s log_dir=%s", args.input, args.output, args.log_dir)
+    LOG.info(
+        "Args: input=%s output=%s log_dir=%s file_logs=%s",
+        args.input,
+        args.output,
+        args.log_dir,
+        args.file_logs,
+    )
     app = QApplication(sys.argv)
     win = BlotchEqualizerWindow(args)
     win.show()
@@ -2563,5 +2625,9 @@ def main(argv: list[str]) -> int:
     return exit_code
 
 
-if __name__ == "__main__":
+def cli() -> None:
     raise SystemExit(main(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    cli()
