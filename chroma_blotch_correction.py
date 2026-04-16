@@ -630,6 +630,14 @@ class BlotchEqualizerWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Blotch Equalizer")
         self.resize(1500, 920)
+        self.step_titles = [
+            "1. Source File",
+            "2. Mask Controls",
+            "3. Field Calculation",
+            "4. Correction",
+            "5. Save",
+        ]
+        self.step_dirty = [False] * len(self.step_titles)
 
         self.pipeline: Optional[PipelineData] = None
         self.current_corrected_rgb: Optional[np.ndarray] = None
@@ -640,9 +648,12 @@ class BlotchEqualizerWindow(QMainWindow):
         self.mask_revision = 0
 
         self.fields_ready = False
+        self.fields_preview_available = False
         self.fields_running = False
         self.fields_revision = 0
 
+        self.correction_ready = False
+        self.correction_preview_available = False
         self.correction_running = False
 
         self.mask_thread: Optional[QThread] = None
@@ -661,6 +672,28 @@ class BlotchEqualizerWindow(QMainWindow):
         button.setProperty("primaryAction", True)
         button.setMinimumHeight(44)
         button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def _refresh_step_titles(self):
+        for i, base in enumerate(self.step_titles):
+            suffix = " *" if self.step_dirty[i] else ""
+            self.toolbox.setItemText(i, f"{base}{suffix}")
+
+    def _set_step_dirty(self, idx: int, dirty: bool):
+        if idx < 0 or idx >= len(self.step_dirty):
+            return
+        if self.step_dirty[idx] == dirty:
+            return
+        self.step_dirty[idx] = dirty
+        self._refresh_step_titles()
+
+    def _mark_steps_dirty_from(self, start_idx: int):
+        changed = False
+        for i in range(max(0, start_idx), len(self.step_dirty)):
+            if not self.step_dirty[i]:
+                self.step_dirty[i] = True
+                changed = True
+        if changed:
+            self._refresh_step_titles()
 
     def _build_ui(self):
         central = QWidget()
@@ -774,7 +807,7 @@ class BlotchEqualizerWindow(QMainWindow):
         lay.addWidget(self.load_btn)
         lay.addStretch(1)
 
-        self.toolbox.addItem(page, "1. Source File")
+        self.toolbox.addItem(page, self.step_titles[0])
 
         self.input_browse_btn.clicked.connect(self.on_browse_input)
         self.input_edit.editingFinished.connect(self.on_input_changed)
@@ -814,7 +847,7 @@ class BlotchEqualizerWindow(QMainWindow):
         lay.setStretch(0, 1)
         lay.addStretch(1)
 
-        self.toolbox.addItem(page, "2. Mask Controls")
+        self.toolbox.addItem(page, self.step_titles[1])
 
         self.reset_curve_btn.clicked.connect(self.on_reset_curve)
         self.apply_mask_btn.clicked.connect(self.on_apply_mask_clicked)
@@ -851,7 +884,7 @@ class BlotchEqualizerWindow(QMainWindow):
         lay.addWidget(self.fields_preview_btn)
         lay.addStretch(1)
 
-        self.toolbox.addItem(page, "3. Field Calculation")
+        self.toolbox.addItem(page, self.step_titles[2])
 
         self.sigma_slider.valueChanged.connect(self.on_sigma_changed)
         self.fields_preview_btn.clicked.connect(self.on_fields_preview)
@@ -889,7 +922,7 @@ class BlotchEqualizerWindow(QMainWindow):
         lay.addWidget(self.correction_preview_btn)
         lay.addStretch(1)
 
-        self.toolbox.addItem(page, "4. Correction")
+        self.toolbox.addItem(page, self.step_titles[3])
 
         self.rg_strength_slider.valueChanged.connect(self.on_strength_changed)
         self.by_strength_slider.valueChanged.connect(self.on_strength_changed)
@@ -917,7 +950,7 @@ class BlotchEqualizerWindow(QMainWindow):
         lay.addWidget(self.save_btn)
         lay.addStretch(1)
 
-        self.toolbox.addItem(page, "5. Save")
+        self.toolbox.addItem(page, self.step_titles[4])
 
         self.output_browse_btn.clicked.connect(self.on_browse_output)
         self.save_btn.clicked.connect(self.on_save)
@@ -953,6 +986,7 @@ class BlotchEqualizerWindow(QMainWindow):
             self.status("No 16-bit TIFF found. Select source file.")
             self.toolbox.setCurrentIndex(0)
             self.on_step_changed(0)
+            self._refresh_step_titles()
             return
 
         self.input_edit.setText(str(input_path))
@@ -969,17 +1003,12 @@ class BlotchEqualizerWindow(QMainWindow):
         self.status("Source preselected. Press Load to start.")
         self.toolbox.setCurrentIndex(0)
         self.on_step_changed(0)
+        self._refresh_step_titles()
 
     def invalidate_fields(self):
         self.fields_revision += 1
         self.fields_ready = False
-        if self.pipeline is not None:
-            self.pipeline.RG_field.fill(0.0)
-            self.pipeline.BY_field.fill(0.0)
-            self.pipeline.apply_alpha.fill(0.0)
-        self.rg_view.set_placeholder("RG preview not available")
-        self.by_view.set_placeholder("BY preview not available")
-        self.current_corrected_rgb = None
+        self.correction_ready = False
 
     def load_input(self, path: Path):
         LOG.info("Loading input file: %s", path)
@@ -1026,8 +1055,16 @@ class BlotchEqualizerWindow(QMainWindow):
         )
 
         self.mask_ready = False
+        self.fields_preview_available = False
+        self.correction_preview_available = False
+        self.correction_ready = False
+        self.current_corrected_rgb = None
         self.invalidate_fields()
+        self._set_step_dirty(0, False)
+        self._mark_steps_dirty_from(1)
         self.update_original_view()
+        self.update_fields_view()
+        self.update_corrected_view()
         self.request_mask_recompute()
 
         LOG.info("Loaded: %s", path)
@@ -1080,6 +1117,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.input_edit.setText(str(path))
         self.output_edit.setText(str(default_output_path(path)))
+        self._set_step_dirty(0, True)
         LOG.info("Input path set: %s", path)
         LOG.info("Output path auto-set: %s", self.output_edit.text().strip())
         self.status("Input path updated. Press Load.")
@@ -1123,6 +1161,7 @@ class BlotchEqualizerWindow(QMainWindow):
     def on_mask_controls_changed(self, *_):
         if self.pipeline is None:
             return
+        self._mark_steps_dirty_from(1)
         LOG.debug(
             "Mask controls changed: invert=%s, blur=%s",
             self.invert_check.isChecked(),
@@ -1133,19 +1172,20 @@ class BlotchEqualizerWindow(QMainWindow):
     def on_sigma_changed(self, value: int):
         self.sigma_value.setText(str(value))
         self.invalidate_fields()
+        self._mark_steps_dirty_from(2)
         LOG.info("Field sigma slider changed: sigma_lo=%d sigma_hi=%d", value, value * 2)
         self.status("Gaussian tile size changed. RG/BY fields need new Preview.")
 
     def on_strength_changed(self):
         self.rg_strength_value.setText(str(self.rg_strength_slider.value()))
         self.by_strength_value.setText(str(self.by_strength_slider.value()))
+        self.correction_ready = False
+        self._mark_steps_dirty_from(3)
         LOG.info(
             "Correction strengths changed: RG=%d%% BY=%d%%",
             self.rg_strength_slider.value(),
             self.by_strength_slider.value(),
         )
-        self.current_corrected_rgb = None
-        self.corrected_view.set_placeholder("Press Preview to update corrected image.")
 
     def request_mask_recompute(self):
         if self.pipeline is None:
@@ -1210,6 +1250,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.pipeline.range_soft = result["range_soft"]
         self.pipeline.working_mask = result["working_mask"]
         self.mask_ready = True
+        self._set_step_dirty(1, False)
         self.invalidate_fields()
 
         if self.toolbox.currentIndex() == 1:
@@ -1324,7 +1365,9 @@ class BlotchEqualizerWindow(QMainWindow):
         self.pipeline.BY_field = result["BY_field"]
         self.pipeline.apply_alpha = result["apply_alpha"]
         self.fields_ready = True
-        self.current_corrected_rgb = None
+        self.fields_preview_available = True
+        self.correction_ready = False
+        self._set_step_dirty(2, False)
 
         LOG.info("RG axis sign convention: rg_sign=%+.0f", result["rg_sign"])
         LOG.info(
@@ -1440,6 +1483,10 @@ class BlotchEqualizerWindow(QMainWindow):
         self.correction_running = False
         self.correction_preview_btn.setEnabled(True)
         self.current_corrected_rgb = result["rgb_corr"]
+        self.correction_preview_available = True
+        self.correction_ready = True
+        self._set_step_dirty(3, False)
+        self._set_step_dirty(4, False)
         if self.toolbox.currentIndex() in (3, 4):
             self.update_corrected_view()
         LOG.info(
@@ -1489,7 +1536,7 @@ class BlotchEqualizerWindow(QMainWindow):
         if not self.fields_ready:
             self.show_error("Run Preview in step 3 before saving.")
             return
-        if self.current_corrected_rgb is None:
+        if not self.correction_ready or self.current_corrected_rgb is None:
             self.show_error("Run Preview in step 4 before saving.")
             return
 
@@ -1556,7 +1603,7 @@ class BlotchEqualizerWindow(QMainWindow):
             self.by_view.set_placeholder("BY field")
             return
 
-        if not self.fields_ready:
+        if not self.fields_preview_available:
             self.rg_view.set_placeholder("RG preview not available")
             self.by_view.set_placeholder("BY preview not available")
             return
@@ -1572,10 +1619,7 @@ class BlotchEqualizerWindow(QMainWindow):
             self.corrected_view.set_placeholder("Corrected preview")
             return
 
-        if not self.fields_ready:
-            self.corrected_view.set_placeholder("Run step 3 Preview first.")
-            return
-        if self.current_corrected_rgb is None:
+        if not self.correction_preview_available or self.current_corrected_rgb is None:
             self.corrected_view.set_placeholder("Press Preview in step 4.")
             return
         self.corrected_view.set_image(self.current_corrected_rgb)
