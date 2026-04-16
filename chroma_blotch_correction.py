@@ -10,7 +10,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 if "MPLCONFIGDIR" not in os.environ:
@@ -18,13 +18,20 @@ if "MPLCONFIGDIR" not in os.environ:
 from matplotlib import cm
 from scipy import ndimage as ndi
 from skimage import color, filters, morphology
-from tifffile import TiffFile, imread, imwrite
+from tifffile import TiffFile, imwrite
+try:
+    from astropy.io import fits as astrofits
+    ASTROPY_AVAILABLE = True
+except Exception:
+    astrofits = None
+    ASTROPY_AVAILABLE = False
 
 from PyQt6.QtCore import QObject, QThread, QTimer, Qt, QtMsgType, pyqtSignal, pyqtSlot, qInstallMessageHandler
 from PyQt6.QtGui import QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -52,6 +59,52 @@ def choose_blur_workers(max_workers: int = 4) -> int:
     if cores is None:
         return 1
     return int(max(1, min(max_workers, cores)))
+
+
+SUPPORTED_INPUT_SUFFIXES = {".tif", ".tiff", ".fit", ".fits", ".fts"}
+TIFF_SUFFIXES = {".tif", ".tiff"}
+FITS_SUFFIXES = {".fit", ".fits", ".fts"}
+BIT_DEPTH_CHOICES = [
+    ("8-bit int", "uint8"),
+    ("16-bit int", "uint16"),
+    ("32-bit float", "float32"),
+]
+BIT_DEPTH_CODE_TO_LABEL = {code: label for label, code in BIT_DEPTH_CHOICES}
+
+
+def infer_image_format(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in TIFF_SUFFIXES:
+        return "tiff"
+    if suffix in FITS_SUFFIXES:
+        return "fits"
+    raise RuntimeError(f"Unsupported file extension: {path.suffix}")
+
+
+def bit_depth_code_from_dtype(dtype: np.dtype) -> Optional[str]:
+    dt = np.dtype(dtype)
+    if np.issubdtype(dt, np.floating):
+        if dt.itemsize == 4:
+            return "float32"
+        return None
+    if np.issubdtype(dt, np.integer):
+        if dt.itemsize <= 1:
+            return "uint8"
+        if dt.itemsize <= 2:
+            return "uint16"
+        return None
+    return None
+
+
+def bit_depth_label_from_dtype(dtype: np.dtype) -> Optional[str]:
+    code = bit_depth_code_from_dtype(dtype)
+    if code is None:
+        return None
+    return BIT_DEPTH_CODE_TO_LABEL[code]
+
+
+def default_output_extension_for_format(fmt: str) -> str:
+    return ".fits" if fmt == "fits" else ".tiff"
 
 
 APP_LOGGER_NAME = "chroma_blotch"
@@ -115,8 +168,11 @@ def qt_message_handler(msg_type, context, message):
 def find_default_input(search_dir: Path) -> Optional[Path]:
     candidates = sorted(
         p
-        for p in search_dir.glob("*.tif*")
-        if "_equalized" not in p.stem.lower() and "_corrected" not in p.stem.lower()
+        for p in search_dir.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in SUPPORTED_INPUT_SUFFIXES
+        and "_equalized" not in p.stem.lower()
+        and "_corrected" not in p.stem.lower()
     )
     if not candidates:
         return None
@@ -133,9 +189,23 @@ def find_default_input(search_dir: Path) -> Optional[Path]:
 
     for path in ordered:
         try:
-            with TiffFile(path) as tf:
-                if tf.pages[0].dtype == np.uint16:
-                    return path
+            fmt = infer_image_format(path)
+            if fmt == "tiff":
+                with TiffFile(path) as tf:
+                    code = bit_depth_code_from_dtype(tf.pages[0].dtype)
+                    if code in {"uint8", "uint16", "float32"}:
+                        return path
+            elif fmt == "fits":
+                if not ASTROPY_AVAILABLE:
+                    continue
+                # Avoid memmap here: scaled FITS data (BZERO/BSCALE) may fail with memmap.
+                with astrofits.open(path, memmap=False) as hdul:  # type: ignore[union-attr]
+                    image_hdu = next((h for h in hdul if getattr(h, "data", None) is not None), None)
+                    if image_hdu is None:
+                        continue
+                    bitpix = int(image_hdu.header.get("BITPIX", 0))
+                    if bitpix in (8, 16, -32):
+                        return path
         except Exception:
             continue
 
@@ -143,14 +213,25 @@ def find_default_input(search_dir: Path) -> Optional[Path]:
 
 
 def default_output_path(input_path: Path) -> Path:
-    return input_path.with_name(f"{input_path.stem}_equalized.tiff")
+    suffix = ".fits" if input_path.suffix.lower() in FITS_SUFFIXES else ".tiff"
+    return input_path.with_name(f"{input_path.stem}_equalized{suffix}")
 
 
 def normalize_rgb(rgb: np.ndarray) -> np.ndarray:
     if rgb.ndim == 2:
         rgb = np.stack([rgb, rgb, rgb], axis=-1)
-    elif rgb.ndim == 3 and rgb.shape[-1] > 3:
+    elif rgb.ndim == 3 and rgb.shape[-1] not in (1, 3, 4) and rgb.shape[0] in (1, 3, 4):
+        rgb = np.moveaxis(rgb, 0, -1)
+
+    if rgb.ndim != 3:
+        raise RuntimeError(f"Expected 2D/3D image, got shape={rgb.shape}")
+
+    if rgb.shape[-1] == 1:
+        rgb = np.repeat(rgb, 3, axis=-1)
+    elif rgb.shape[-1] > 3:
         rgb = rgb[..., :3]
+    elif rgb.shape[-1] != 3:
+        raise RuntimeError(f"Expected RGB-like channels, got shape={rgb.shape}")
 
     if np.issubdtype(rgb.dtype, np.integer):
         rgb_float = rgb.astype(np.float32) / np.iinfo(rgb.dtype).max
@@ -162,6 +243,143 @@ def normalize_rgb(rgb: np.ndarray) -> np.ndarray:
 
     rgb_float = np.nan_to_num(rgb_float, nan=0.0, posinf=1.0, neginf=0.0)
     return clamp01(rgb_float)
+
+
+def _fits_require_astropy():
+    if not ASTROPY_AVAILABLE:
+        raise RuntimeError(
+            "FITS support requires astropy. Install it with: pip install astropy"
+        )
+
+
+def _extract_tiff_metadata(path: Path) -> dict[str, Any]:
+    with TiffFile(path) as tf:
+        page = tf.pages[0]
+        xres_tag = page.tags.get("XResolution")
+        yres_tag = page.tags.get("YResolution")
+        ru_tag = page.tags.get("ResolutionUnit")
+        resolution = None
+        if xres_tag is not None and yres_tag is not None:
+            xv = xres_tag.value
+            yv = yres_tag.value
+            try:
+                resolution = (float(xv[0]) / float(xv[1]), float(yv[0]) / float(yv[1]))
+            except Exception:
+                resolution = None
+
+        compression = None
+        try:
+            compression = str(page.compression.name).lower()
+        except Exception:
+            compression = None
+
+        description = page.description if isinstance(page.description, str) and page.description else None
+        metadata = tf.imagej_metadata if getattr(tf, "is_imagej", False) else None
+        photometric = "rgb"
+        planarconfig = None
+        try:
+            planarconfig = str(page.planarconfig.name).lower()
+        except Exception:
+            planarconfig = None
+        software = page.tags.get("Software").value if page.tags.get("Software") is not None else None
+
+    return {
+        "tiff_description": description,
+        "tiff_metadata": metadata,
+        "tiff_is_imagej": bool(metadata),
+        "tiff_resolution": resolution,
+        "tiff_resolutionunit": int(ru_tag.value) if ru_tag is not None else None,
+        "tiff_compression": compression,
+        "tiff_photometric": photometric,
+        "tiff_planarconfig": planarconfig,
+        "tiff_software": software,
+    }
+
+
+def read_image_for_pipeline(path: Path) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    fmt = infer_image_format(path)
+
+    if fmt == "tiff":
+        with TiffFile(path) as tf:
+            page = tf.pages[0]
+            raw = page.asarray()
+            input_dtype = np.dtype(page.dtype)
+        bit_code = bit_depth_code_from_dtype(input_dtype)
+        if bit_code is None:
+            raise RuntimeError(f"Unsupported TIFF dtype: {input_dtype}. Expected 8/16-bit int or 32-bit float.")
+
+        rgb_raw = raw
+        rgb_float = normalize_rgb(rgb_raw)
+        io_meta = {
+            "source_format": "tiff",
+            "source_bit_depth": bit_code,
+            "source_dtype": str(input_dtype),
+            **_extract_tiff_metadata(path),
+        }
+        return {
+            "path": str(path),
+            "rgb_raw": rgb_raw,
+            "rgb_float": rgb_float,
+            "input_format": "tiff",
+            "input_bit_depth": bit_code,
+            "input_dtype_str": str(input_dtype),
+            "io_meta": io_meta,
+        }
+
+    _fits_require_astropy()
+    # memmap=False is required for robust reads when FITS uses scaling keywords
+    # (common for unsigned integer images written via BZERO/BSCALE).
+    with astrofits.open(path, memmap=False) as hdul:  # type: ignore[union-attr]
+        hdu_idx = None
+        image_hdu = None
+        for i, hdu in enumerate(hdul):
+            if getattr(hdu, "data", None) is not None:
+                hdu_idx = i
+                image_hdu = hdu
+                break
+        if image_hdu is None or hdu_idx is None:
+            raise RuntimeError("No image HDU with data found in FITS file.")
+
+        bitpix = int(image_hdu.header.get("BITPIX", 0))
+        if bitpix not in (8, 16, -32):
+            raise RuntimeError(f"Unsupported FITS BITPIX={bitpix}. Expected 8, 16, or -32.")
+        raw = np.asarray(image_hdu.data)
+
+    input_dtype = np.dtype(raw.dtype)
+    bit_code = "float32" if bitpix == -32 else ("uint8" if bitpix == 8 else "uint16")
+    rgb_raw = raw
+    rgb_float = normalize_rgb(rgb_raw)
+    io_meta = {
+        "source_format": "fits",
+        "source_bit_depth": bit_code,
+        "source_dtype": str(input_dtype),
+        "fits_template_path": str(path),
+        "fits_hdu_index": int(hdu_idx),
+        "fits_bitpix": bitpix,
+        "fits_original_shape": tuple(int(v) for v in raw.shape),
+        "fits_channel_axis_first": bool(raw.ndim == 3 and raw.shape[0] in (3, 4) and raw.shape[-1] not in (3, 4)),
+    }
+    return {
+        "path": str(path),
+        "rgb_raw": rgb_raw,
+        "rgb_float": rgb_float,
+        "input_format": "fits",
+        "input_bit_depth": bit_code,
+        "input_dtype_str": str(input_dtype),
+        "io_meta": io_meta,
+    }
+
+
+def encode_rgb_output(rgb_corr: np.ndarray, bit_depth_code: str) -> np.ndarray:
+    x = clamp01(rgb_corr).astype(np.float32, copy=False)
+    if bit_depth_code == "float32":
+        return x.astype(np.float32, copy=False)
+    if bit_depth_code == "uint16":
+        return np.round(x * np.iinfo(np.uint16).max).astype(np.uint16)
+    if bit_depth_code == "uint8":
+        return np.round(x * np.iinfo(np.uint8).max).astype(np.uint8)
+    raise RuntimeError(f"Unsupported output bit depth: {bit_depth_code}")
 
 
 def robust_center(x: np.ndarray, mask: np.ndarray) -> float:
@@ -292,6 +510,10 @@ def heatmap_rgb(data: np.ndarray, mask: np.ndarray, cmap_name: str) -> np.ndarra
 class PipelineData:
     input_path: Path
     output_path: Path
+    input_format: str
+    input_bit_depth: str
+    input_dtype_str: str
+    io_meta: dict[str, Any]
     rgb_raw: np.ndarray
     rgb_float: np.ndarray
     lab: np.ndarray
@@ -447,13 +669,17 @@ class LoadWorker(QObject):
             self.progress.emit(int(np.clip(percent, 0, 100)), text)
 
         try:
-            emit_progress(5, "Reading TIFF from disk")
-            rgb_raw = imread(self.path)
-            if rgb_raw.dtype != np.uint16:
-                raise RuntimeError(f"Only 16-bit TIFF is supported right now. Got dtype={rgb_raw.dtype}")
+            p = Path(self.path).expanduser().resolve()
+            emit_progress(5, "Reading image from disk")
+            loaded = read_image_for_pipeline(p)
+            rgb_raw = loaded["rgb_raw"]
+            rgb_float = loaded["rgb_float"]
+            input_format = loaded["input_format"]
+            input_bit_depth = loaded["input_bit_depth"]
+            input_dtype_str = loaded["input_dtype_str"]
+            io_meta = loaded["io_meta"]
 
-            emit_progress(38, "Normalizing RGB")
-            rgb_float = normalize_rgb(rgb_raw)
+            emit_progress(38, f"Input validated: {input_format.upper()} / {BIT_DEPTH_CODE_TO_LABEL[input_bit_depth]}")
 
             emit_progress(58, "Converting RGB -> Lab")
             lab = color.rgb2lab(rgb_float).astype(np.float32)
@@ -478,9 +704,13 @@ class LoadWorker(QObject):
             emit_progress(98, "Finalizing load")
             self.finished.emit(
                 {
-                    "path": self.path,
+                    "path": str(p),
                     "rgb_raw": rgb_raw,
                     "rgb_float": rgb_float,
+                    "input_format": input_format,
+                    "input_bit_depth": input_bit_depth,
+                    "input_dtype_str": input_dtype_str,
+                    "io_meta": io_meta,
                     "lab": lab,
                     "L": L,
                     "a": a,
@@ -1097,7 +1327,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.input_browse_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._style_primary_action_button(self.load_btn)
 
-        lay.addWidget(QLabel("Input 16-bit TIFF:"))
+        lay.addWidget(QLabel("Input image (TIFF/FITS, 8/16-bit int or 32-bit float):"))
         lay.addWidget(row)
         lay.addWidget(self.load_btn)
         lay.addStretch(1)
@@ -1241,6 +1471,8 @@ class BlotchEqualizerWindow(QMainWindow):
         lay = QVBoxLayout(page)
         self.output_edit = QLineEdit()
         self.output_browse_btn = QPushButton("Browse")
+        self.save_format_combo = QComboBox()
+        self.save_bitdepth_combo = QComboBox()
 
         row = QWidget()
         r = QHBoxLayout(row)
@@ -1250,8 +1482,21 @@ class BlotchEqualizerWindow(QMainWindow):
         self.output_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.output_browse_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-        lay.addWidget(QLabel("Output TIFF:"))
+        format_row = QWidget()
+        fr = QHBoxLayout(format_row)
+        fr.setContentsMargins(0, 0, 0, 0)
+        fr.addWidget(QLabel("Format:"))
+        fr.addWidget(self.save_format_combo, 1)
+        fr.addWidget(QLabel("Bit depth:"))
+        fr.addWidget(self.save_bitdepth_combo, 1)
+
+        self.save_format_combo.addItem("TIFF", "tiff")
+        self.save_format_combo.addItem("FITS", "fits")
+        self._populate_bitdepth_combo("tiff")
+
+        lay.addWidget(QLabel("Output file:"))
         lay.addWidget(row)
+        lay.addWidget(format_row)
 
         self.save_btn = QPushButton("Save")
         self._style_primary_action_button(self.save_btn)
@@ -1262,7 +1507,67 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.output_browse_btn.clicked.connect(self.on_browse_output)
         self.output_edit.editingFinished.connect(self.on_output_changed)
+        self.save_format_combo.currentIndexChanged.connect(self.on_save_format_changed)
+        self.save_bitdepth_combo.currentIndexChanged.connect(self.on_save_bitdepth_changed)
         self.save_btn.clicked.connect(self.on_save)
+
+    def _selected_save_format(self) -> str:
+        return str(self.save_format_combo.currentData() or "tiff")
+
+    def _selected_save_bit_depth(self) -> str:
+        return str(self.save_bitdepth_combo.currentData() or "uint16")
+
+    def _populate_bitdepth_combo(self, fmt: str, preferred_code: Optional[str] = None):
+        prev_code = self._selected_save_bit_depth() if self.save_bitdepth_combo.count() > 0 else None
+        keep_code = preferred_code or prev_code or "uint16"
+        self.save_bitdepth_combo.blockSignals(True)
+        self.save_bitdepth_combo.clear()
+        for label, code in BIT_DEPTH_CHOICES:
+            self.save_bitdepth_combo.addItem(label, code)
+        idx = self.save_bitdepth_combo.findData(keep_code)
+        if idx < 0:
+            idx = self.save_bitdepth_combo.findData("uint16")
+        if idx < 0:
+            idx = 0
+        self.save_bitdepth_combo.setCurrentIndex(idx)
+        self.save_bitdepth_combo.blockSignals(False)
+
+    def _sync_output_extension_to_format(self, mark_dirty: bool = True):
+        text = self.output_edit.text().strip()
+        if not text:
+            return
+        fmt = self._selected_save_format()
+        allowed_suffixes = FITS_SUFFIXES if fmt == "fits" else TIFF_SUFFIXES
+        suffix = default_output_extension_for_format(fmt)
+        p = Path(text).expanduser().resolve()
+        if p.suffix.lower() not in allowed_suffixes:
+            p = p.with_suffix(suffix)
+            self.output_edit.setText(str(p))
+            if mark_dirty:
+                self._set_step_dirty(4, True)
+                self.status("Output extension updated for selected format.")
+
+    def _set_save_defaults_from_loaded(self, input_format: str, input_bit_depth: str):
+        self.save_format_combo.blockSignals(True)
+        fmt_idx = self.save_format_combo.findData(input_format)
+        self.save_format_combo.setCurrentIndex(fmt_idx if fmt_idx >= 0 else 0)
+        self.save_format_combo.blockSignals(False)
+        self._populate_bitdepth_combo(input_format, preferred_code=input_bit_depth)
+        self._sync_output_extension_to_format(mark_dirty=False)
+
+    def on_save_format_changed(self):
+        fmt = self._selected_save_format()
+        self._populate_bitdepth_combo(fmt)
+        self._sync_output_extension_to_format(mark_dirty=True)
+        self._set_step_dirty(4, True)
+        LOG.info("Save format changed: %s", fmt)
+        self.status("Save format changed.")
+
+    def on_save_bitdepth_changed(self):
+        code = self._selected_save_bit_depth()
+        self._set_step_dirty(4, True)
+        LOG.info("Save bit depth changed: %s", code)
+        self.status("Save bit depth changed.")
 
     def status(self, text: str):
         self.statusBar().showMessage(text)
@@ -1296,8 +1601,8 @@ class BlotchEqualizerWindow(QMainWindow):
     def _init_paths(self, input_arg: str, output_arg: str):
         input_path = Path(input_arg).expanduser().resolve() if input_arg else find_default_input(Path.cwd())
         if input_path is None:
-            LOG.info("No default 16-bit TIFF found in %s", Path.cwd())
-            self.status("No 16-bit TIFF found. Select source file.")
+            LOG.info("No default supported TIFF/FITS found in %s", Path.cwd())
+            self.status("No supported TIFF/FITS found. Select source file.")
             self.toolbox.setCurrentIndex(0)
             self.on_step_changed(0)
             self._refresh_step_titles()
@@ -1306,6 +1611,8 @@ class BlotchEqualizerWindow(QMainWindow):
         self.input_edit.setText(str(input_path))
         out = Path(output_arg).expanduser().resolve() if output_arg else default_output_path(input_path)
         self.output_edit.setText(str(out))
+        input_fmt = infer_image_format(input_path)
+        self._set_save_defaults_from_loaded(input_fmt, "uint16")
         LOG.info("Default input candidate: %s", input_path)
         LOG.info("Default output candidate: %s", out)
 
@@ -1333,6 +1640,9 @@ class BlotchEqualizerWindow(QMainWindow):
         path = path.expanduser().resolve()
         if not path.exists():
             self.show_error(f"Input file not found: {path}")
+            return
+        if path.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
+            self.show_error(f"Unsupported input extension: {path.suffix}. Use TIFF/FITS.")
             return
 
         self.load_thread = QThread(self)
@@ -1366,6 +1676,10 @@ class BlotchEqualizerWindow(QMainWindow):
         path = Path(result["path"])
         rgb_raw = result["rgb_raw"]
         rgb_float = result["rgb_float"]
+        input_format = result["input_format"]
+        input_bit_depth = result["input_bit_depth"]
+        input_dtype_str = result["input_dtype_str"]
+        io_meta = result["io_meta"]
         lab = result["lab"]
         L = result["L"]
         a = result["a"]
@@ -1378,6 +1692,10 @@ class BlotchEqualizerWindow(QMainWindow):
         self.pipeline = PipelineData(
             input_path=path,
             output_path=Path(self.output_edit.text().strip()),
+            input_format=input_format,
+            input_bit_depth=input_bit_depth,
+            input_dtype_str=input_dtype_str,
+            io_meta=io_meta,
             rgb_raw=rgb_raw,
             rgb_float=rgb_float,
             lab=lab,
@@ -1407,11 +1725,13 @@ class BlotchEqualizerWindow(QMainWindow):
         self.update_original_view()
         self.update_fields_view()
         self.update_corrected_view()
+        self._set_save_defaults_from_loaded(input_format, input_bit_depth)
         self.auto_open_step2_after_mask = self.auto_target_step == 0
         self.status("Image displayed. Recomputing mask in background...")
         QTimer.singleShot(0, self.request_mask_recompute)
 
         LOG.info("Loaded: %s", path)
+        LOG.info("Input format=%s bit_depth=%s dtype=%s", input_format, input_bit_depth, input_dtype_str)
         LOG.info("Load elapsed: %.2fs", result["elapsed"])
         LOG.info("Raw shape=%s, dtype=%s", rgb_raw.shape, rgb_raw.dtype)
         LOG.info("L range: %.3f .. %.3f", float(np.min(L)), float(np.max(L)))
@@ -1435,7 +1755,10 @@ class BlotchEqualizerWindow(QMainWindow):
         LOG.info("background pixels: %.2f%%", base_stats["background_ratio_pct"])
         LOG.info("Base mask precompute during load is skipped; step-2 mask is built asynchronously.")
 
-        self.status(f"Loaded: {path.name} | shape={rgb_raw.shape} | dtype={rgb_raw.dtype}")
+        self.status(
+            f"Loaded: {path.name} | format={input_format.upper()} | "
+            f"bit={BIT_DEPTH_CODE_TO_LABEL.get(input_bit_depth, input_bit_depth)} | dtype={rgb_raw.dtype}"
+        )
 
     @pyqtSlot(str)
     def on_load_failed(self, message: str):
@@ -1466,9 +1789,9 @@ class BlotchEqualizerWindow(QMainWindow):
         LOG.debug("Browse input from: %s", current)
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select 16-bit TIFF",
+            "Select TIFF/FITS image",
             str(Path(current).parent if Path(current).exists() else Path.cwd()),
-            "TIFF files (*.tif *.tiff)",
+            "Images (*.tif *.tiff *.fit *.fits *.fts)",
         )
         if not path:
             return
@@ -1487,6 +1810,10 @@ class BlotchEqualizerWindow(QMainWindow):
 
         self.input_edit.setText(str(path))
         self.output_edit.setText(str(default_output_path(path)))
+        try:
+            self._set_save_defaults_from_loaded(infer_image_format(path), "uint16")
+        except Exception:
+            pass
         self._set_step_dirty(0, True)
         self._mark_steps_dirty_from(1)
         LOG.info("Input path set: %s", path)
@@ -1506,16 +1833,19 @@ class BlotchEqualizerWindow(QMainWindow):
         self.load_input(path)
 
     def on_browse_output(self):
-        current = self.output_edit.text().strip() or str(Path.cwd() / "output_equalized.tiff")
+        current = self.output_edit.text().strip() or str(Path.cwd() / f"output_equalized{default_output_extension_for_format(self._selected_save_format())}")
         LOG.debug("Browse output from: %s", current)
+        fmt = self._selected_save_format()
+        filt = "FITS files (*.fit *.fits *.fts)" if fmt == "fits" else "TIFF files (*.tif *.tiff)"
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Select output TIFF",
+            "Select output image",
             current,
-            "TIFF files (*.tif *.tiff)",
+            filt,
         )
         if path:
             self.output_edit.setText(path)
+            self._sync_output_extension_to_format(mark_dirty=False)
             self._set_step_dirty(4, True)
             LOG.info("Output selected via dialog: %s", path)
             self.status("Output path updated. Press Save to write result.")
@@ -1976,17 +2306,26 @@ class BlotchEqualizerWindow(QMainWindow):
         if self.current_corrected_rgb is None:
             raise RuntimeError("Corrected preview is empty.")
         rgb_corr = self.current_corrected_rgb
+        out_fmt = self._selected_save_format()
+        out_bit = self._selected_save_bit_depth()
         out_path = Path(self.output_edit.text().strip())
         if not out_path.suffix:
-            out_path = out_path.with_suffix(".tiff")
+            out_path = out_path.with_suffix(default_output_extension_for_format(out_fmt))
             self.output_edit.setText(str(out_path))
-        if out_path.suffix.lower() not in {".tif", ".tiff"}:
-            out_path = out_path.with_suffix(".tiff")
+        expected_suffixes = FITS_SUFFIXES if out_fmt == "fits" else TIFF_SUFFIXES
+        if out_path.suffix.lower() not in expected_suffixes:
+            out_path = out_path.with_suffix(default_output_extension_for_format(out_fmt))
             self.output_edit.setText(str(out_path))
 
-        saved = self.save_tiff(rgb_corr, out_path)
-        LOG.info("Saved output TIFF: %s", saved)
-        LOG.info("Saved shape=%s dtype=%s", rgb_corr.shape, np.uint16)
+        saved = self.save_image(
+            rgb_corr=rgb_corr,
+            output_path=out_path,
+            output_format=out_fmt,
+            bit_depth_code=out_bit,
+            io_meta=self.pipeline.io_meta,
+        )
+        LOG.info("Saved output image: %s", saved)
+        LOG.info("Saved shape=%s format=%s bit_depth=%s", rgb_corr.shape, out_fmt, out_bit)
         self._set_step_dirty(4, False)
         self.status(f"Saved: {saved}")
         QMessageBox.information(self, "Saved", f"Saved: {saved}")
@@ -1994,13 +2333,78 @@ class BlotchEqualizerWindow(QMainWindow):
     def on_save(self):
         self._request_auto_run(5, "step5_save_clicked")
 
-    def save_tiff(self, rgb_corr: np.ndarray, output_path: Path) -> Path:
+    def _save_tiff(self, rgb_corr: np.ndarray, output_path: Path, bit_depth_code: str, io_meta: dict[str, Any]) -> Path:
+        output_path = output_path.expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        out = encode_rgb_output(rgb_corr, bit_depth_code)
+
+        kwargs: dict[str, Any] = {
+            "photometric": "rgb",
+            "planarconfig": "CONTIG",
+        }
+
+        if io_meta.get("source_format") == "tiff":
+            resolution = io_meta.get("tiff_resolution")
+            resolutionunit = io_meta.get("tiff_resolutionunit")
+            compression = io_meta.get("tiff_compression")
+            software = io_meta.get("tiff_software")
+            if resolution is not None:
+                kwargs["resolution"] = resolution
+            if resolutionunit is not None:
+                kwargs["resolutionunit"] = resolutionunit
+            if compression and compression not in {"none", "uncompressed", "1"}:
+                kwargs["compression"] = compression
+            if software:
+                kwargs["software"] = software
+            if io_meta.get("tiff_is_imagej") and io_meta.get("tiff_metadata"):
+                kwargs["imagej"] = True
+                kwargs["metadata"] = io_meta["tiff_metadata"]
+            elif io_meta.get("tiff_description"):
+                kwargs["description"] = io_meta["tiff_description"]
+
+        imwrite(output_path, out, **kwargs)
+        return output_path
+
+    def _save_fits(self, rgb_corr: np.ndarray, output_path: Path, bit_depth_code: str, io_meta: dict[str, Any]) -> Path:
+        _fits_require_astropy()
         output_path = output_path.expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        out = np.round(rgb_corr * np.iinfo(np.uint16).max).astype(np.uint16)
-        imwrite(output_path, out)
+        out = encode_rgb_output(rgb_corr, bit_depth_code)
+        if out.ndim == 3:
+            # FITS expects image cube axes as (C, Y, X) for sane viewer behavior.
+            # Keep source FITS axis order when we have a FITS template;
+            # otherwise (e.g. TIFF->FITS) force channel-first.
+            if io_meta.get("source_format") == "fits":
+                if io_meta.get("fits_channel_axis_first"):
+                    out = np.moveaxis(out, -1, 0)
+            else:
+                out = np.moveaxis(out, -1, 0)
+
+        template_path = io_meta.get("fits_template_path")
+        hdu_index = int(io_meta.get("fits_hdu_index", 0))
+        if template_path and Path(template_path).exists():
+            with astrofits.open(template_path, memmap=False) as hdul:  # type: ignore[union-attr]
+                if hdu_index >= len(hdul):
+                    raise RuntimeError(f"Template FITS HDU index out of range: {hdu_index}")
+                hdul[hdu_index].data = out
+                hdul.writeto(output_path, overwrite=True)
+        else:
+            hdu = astrofits.PrimaryHDU(out)  # type: ignore[union-attr]
+            astrofits.HDUList([hdu]).writeto(output_path, overwrite=True)  # type: ignore[union-attr]
         return output_path
+
+    def save_image(
+        self,
+        rgb_corr: np.ndarray,
+        output_path: Path,
+        output_format: str,
+        bit_depth_code: str,
+        io_meta: dict[str, Any],
+    ) -> Path:
+        if output_format == "fits":
+            return self._save_fits(rgb_corr, output_path, bit_depth_code, io_meta)
+        return self._save_tiff(rgb_corr, output_path, bit_depth_code, io_meta)
 
     def on_step_changed(self, idx: int):
         LOG.debug("Step changed: %d", idx + 1)
@@ -2098,8 +2502,8 @@ class BlotchEqualizerWindow(QMainWindow):
 
 def parse_args(argv: list[str]):
     parser = argparse.ArgumentParser(description="Standalone blotch equalizer (RG/BY background field correction)")
-    parser.add_argument("--input", default="", help="Input 16-bit TIFF")
-    parser.add_argument("--output", default="", help="Output TIFF path")
+    parser.add_argument("--input", default="", help="Input TIFF/FITS image")
+    parser.add_argument("--output", default="", help="Output image path (TIFF/FITS)")
     parser.add_argument("--log-dir", default="logs", help="Directory for info/debug logs")
     parser.add_argument(
         "--log-level",
