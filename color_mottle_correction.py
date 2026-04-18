@@ -109,7 +109,7 @@ def default_output_extension_for_format(fmt: str) -> str:
     return ".fits" if fmt == "fits" else ".tiff"
 
 
-APP_LOGGER_NAME = "chroma_blotch"
+APP_LOGGER_NAME = "color_mottle"
 LOG = logging.getLogger(APP_LOGGER_NAME)
 QT_LOG = logging.getLogger(f"{APP_LOGGER_NAME}.qt")
 
@@ -132,8 +132,8 @@ def setup_logging(log_dir: Path, console_level: str = "INFO", file_logs: bool = 
 
     if file_logs:
         log_dir.mkdir(parents=True, exist_ok=True)
-        info_path = log_dir / "chroma_blotch_info.log"
-        debug_path = log_dir / "chroma_blotch_debug.log"
+        info_path = log_dir / "color_mottle_info.log"
+        debug_path = log_dir / "color_mottle_debug.log"
 
         info_handler = logging.FileHandler(info_path, encoding="utf-8")
         info_handler.setLevel(logging.INFO)
@@ -1185,7 +1185,7 @@ class BlotchEqualizerWindow(QMainWindow):
     def __init__(self, args):
         super().__init__()
         self.siril_mode = bool(getattr(args, "siril", False))
-        self.setWindowTitle("Chroma Blotch Corrector")
+        self.setWindowTitle("Color Mottle Corrector")
         self.resize(1500, 920)
         self.step_titles = [
             "1. Source File",

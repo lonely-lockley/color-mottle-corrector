@@ -1,6 +1,6 @@
 # Color Mottle Corrector
 
-`chroma-blotch-corrector` is a standalone desktop tool for reducing large-scale background color mottle in stretched OSC astrophotography images.
+`color-mottle-corrector` is a standalone desktop tool for reducing large-scale background color mottle in stretched OSC astrophotography images.
 
 It is intended for cases where residual red/green and blue/yellow background imbalance remains visible after the normal processing pipeline, such as stacking, calibration, gradient removal, and color calibration.
 
@@ -28,7 +28,7 @@ Input and output formats:
 Install from PyPI:
 
 ```bash
-pip install chroma-blotch-corrector
+pip install color-mottle-corrector
 ```
 
 ## Run
@@ -36,7 +36,7 @@ pip install chroma-blotch-corrector
 Start the application:
 
 ```bash
-chroma-blotch-corrector
+color-mottle-corrector
 ```
 
 ## Workflow

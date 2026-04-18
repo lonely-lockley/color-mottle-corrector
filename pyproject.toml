@@ -3,9 +3,9 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "chroma-blotch-corrector"
-version = "1.0"
-description = "Standalone chroma blotch correction tool for astrophotography"
+name = "color-mottle-corrector"
+version = "1.1"
+description = "Standalone color mottle correction tool for astrophotography"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -24,12 +24,12 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/lonely-lockley/chroma-blotch-corrector"
-Repository = "https://github.com/lonely-lockley/chroma-blotch-corrector"
-Issues = "https://github.com/lonely-lockley/chroma-blotch-corrector/issues"
+Homepage = "https://github.com/lonely-lockley/color-mottle-corrector"
+Repository = "https://github.com/lonely-lockley/color-mottle-corrector"
+Issues = "https://github.com/lonely-lockley/color-mottle-corrector/issues"
 
 [project.scripts]
-chroma-blotch-corrector = "chroma_blotch_correction:cli"
+color-mottle-corrector = "color_mottle_correction:cli"
 
 [tool.setuptools]
-py-modules = ["chroma_blotch_correction"]
+py-modules = ["color_mottle_correction"]
