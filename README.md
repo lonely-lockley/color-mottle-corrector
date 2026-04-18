@@ -4,7 +4,25 @@
 
 It is intended for cases where residual red/green and blue/yellow background imbalance remains visible after the normal processing pipeline, such as stacking, calibration, gradient removal, and color calibration.
 
-The tool performs a mask-aware correction in Lab color space using normalized blurred chroma fields to neutralize low-frequency background color artifacts while preserving protected image regions.
+The correction is performed in CIE Lab space.
+
+Only the chroma channels (`a` and `b`) are modified. Luminance (`L`) is left unchanged.
+
+The tool estimates large-scale low-frequency color bias in the background along two chroma axes:
+
+- red / green
+- blue / yellow
+
+These correction fields are built from masked Gaussian-blurred chroma data and recentered so that the algorithm targets relative background color bias rather than absolute image color.
+
+A user-defined soft mask controls where correction is applied:
+
+- protected regions receive little or no correction
+- unprotected regions receive the full intended correction
+- transition zones are blended smoothly
+
+The final correction pushes local chroma bias toward neutral rather than applying arbitrary recoloring.
+
 
 ## Scope and Intended Use
 

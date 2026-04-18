@@ -681,10 +681,8 @@ class PipelineData:
     L: np.ndarray
     a: np.ndarray
     b: np.ndarray
-    base_background_mask: np.ndarray
     L_norm: np.ndarray
     range_soft: np.ndarray
-    working_mask: np.ndarray
     RG_field: np.ndarray
     BY_field: np.ndarray
     apply_alpha: np.ndarray
@@ -953,17 +951,13 @@ class MaskWorker(QObject):
                 range_soft = fit_array_to_shape(range_soft, (h, w))
             up_elapsed = time.perf_counter() - t_up
 
-            working_mask = np.ones((h, w), dtype=bool)
-
             self.finished.emit(
                 {
                     "revision": self.revision,
                     "range_soft": range_soft,
-                    "working_mask": working_mask.astype(bool),
                     "range_min": float(np.min(range_soft)),
                     "range_max": float(np.max(range_soft)),
                     "range_mean": float(np.mean(range_soft)),
-                    "working_mask_pct": float(np.mean(working_mask) * 100.0),
                     "mask_scale": float(scale),
                     "work_shape": tuple(int(v) for v in L_work.shape),
                     "cache_used": bool(cache_used),
@@ -991,7 +985,6 @@ class FieldsWorker(QObject):
         revision: int,
         a: np.ndarray,
         b: np.ndarray,
-        working_mask: np.ndarray,
         range_soft: np.ndarray,
         sigma_lo: int,
     ):
@@ -999,7 +992,6 @@ class FieldsWorker(QObject):
         self.revision = revision
         self.a = a
         self.b = b
-        self.working_mask = working_mask
         self.range_soft = range_soft
         self.sigma_lo = sigma_lo
 
@@ -1010,9 +1002,8 @@ class FieldsWorker(QObject):
             self.progress.emit(int(np.clip(percent, 0, 100)), text)
 
         try:
-            emit_progress(2, "Validating mask")
-            if not np.any(self.working_mask):
-                raise RuntimeError("Background mask is empty. Tune mask controls first.")
+            emit_progress(2, "Preparing field inputs")
+            full_mask = np.ones(self.a.shape, dtype=bool)
 
             sigma_hi = self.sigma_lo * 2
             emit_progress(5, f"Preparing scales sigma={self.sigma_lo}/{sigma_hi}")
@@ -1030,7 +1021,7 @@ class FieldsWorker(QObject):
 
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="field_blur") as pool:
                 futures = {
-                    pool.submit(masked_normalized_blur, channel, self.working_mask, sigma): (key, label)
+                    pool.submit(masked_normalized_blur, channel, full_mask, sigma): (key, label)
                     for key, channel, sigma, label in blur_jobs
                 }
                 done_count = 0
@@ -1047,24 +1038,24 @@ class FieldsWorker(QObject):
 
             emit_progress(68, "Centering RG/BY components")
             rg_sign = 1.0
-            RG_lo = rg_sign * (a_lo - robust_center(a_lo, self.working_mask))
-            RG_hi = rg_sign * (a_hi - robust_center(a_hi, self.working_mask))
-            BY_lo = b_lo - robust_center(b_lo, self.working_mask)
-            BY_hi = b_hi - robust_center(b_hi, self.working_mask)
+            RG_lo = rg_sign * (a_lo - robust_center(a_lo, full_mask))
+            RG_hi = rg_sign * (a_hi - robust_center(a_hi, full_mask))
+            BY_lo = b_lo - robust_center(b_lo, full_mask)
+            BY_hi = b_hi - robust_center(b_hi, full_mask)
 
-            def masked_corr(x, y, mask):
-                xv = x[mask].astype(np.float64)
-                yv = y[mask].astype(np.float64)
+            def masked_corr(x, y):
+                xv = x.astype(np.float64).ravel()
+                yv = y.astype(np.float64).ravel()
                 xv -= xv.mean()
                 yv -= yv.mean()
                 denom = np.linalg.norm(xv) * np.linalg.norm(yv) + 1e-12
                 return float(np.dot(xv, yv) / denom)
 
             emit_progress(76, "Checking scale stability")
-            rg_corr = masked_corr(RG_lo, RG_hi, self.working_mask)
-            by_corr = masked_corr(BY_lo, BY_hi, self.working_mask)
-            thr = np.percentile(np.abs(RG_lo[self.working_mask]), 25)
-            valid_rg = self.working_mask & (np.abs(RG_lo) >= thr)
+            rg_corr = masked_corr(RG_lo, RG_hi)
+            by_corr = masked_corr(BY_lo, BY_hi)
+            thr = np.percentile(np.abs(RG_lo), 25)
+            valid_rg = np.abs(RG_lo) >= thr
             rg_sign_agree = (
                 float(np.mean(np.sign(RG_lo[valid_rg]) == np.sign(RG_hi[valid_rg])) * 100.0)
                 if np.any(valid_rg)
@@ -1079,18 +1070,14 @@ class FieldsWorker(QObject):
 
             emit_progress(92, "Building correction alpha")
             edge_soft_px = 28.0
-            bg_dist = ndi.distance_transform_edt(self.working_mask)
+            bg_dist = ndi.distance_transform_edt(full_mask)
             edge_falloff = clamp01(bg_dist / edge_soft_px).astype(np.float32)
 
             support_mix = w_lo * den_lo + w_hi * den_hi
             support_conf = clamp01((support_mix - 0.15) / 0.85).astype(np.float32)
             mask_apply = (1.0 - self.range_soft).astype(np.float32)
 
-            apply_alpha = np.where(
-                self.working_mask,
-                edge_falloff * support_conf * mask_apply,
-                0.0,
-            ).astype(np.float32)
+            apply_alpha = (edge_falloff * support_conf * mask_apply).astype(np.float32)
 
             elapsed = time.perf_counter() - t0
             emit_progress(98, "Finalizing output")
@@ -1107,10 +1094,10 @@ class FieldsWorker(QObject):
                     "rg_corr": rg_corr,
                     "by_corr": by_corr,
                     "rg_sign_agree_pct": rg_sign_agree,
-                    "rg_std_lo": float(np.std(RG_lo[self.working_mask])),
-                    "by_std_lo": float(np.std(BY_lo[self.working_mask])),
-                    "rg_std_hi": float(np.std(RG_hi[self.working_mask])),
-                    "by_std_hi": float(np.std(BY_hi[self.working_mask])),
+                    "rg_std_lo": float(np.std(RG_lo)),
+                    "by_std_lo": float(np.std(BY_lo)),
+                    "rg_std_hi": float(np.std(RG_hi)),
+                    "by_std_hi": float(np.std(BY_hi)),
                     "elapsed": elapsed,
                 }
             )
@@ -1899,7 +1886,6 @@ class BlotchEqualizerWindow(QMainWindow):
         L_norm = result["L_norm"]
         base_stats = result["base_stats"]
         self.base_mask_stats = base_stats
-        base_background_mask = np.ones_like(L_norm, dtype=bool)
 
         self.pipeline = PipelineData(
             input_path=path,
@@ -1914,10 +1900,8 @@ class BlotchEqualizerWindow(QMainWindow):
             L=L,
             a=a,
             b=b,
-            base_background_mask=base_background_mask,
             L_norm=L_norm,
             range_soft=np.ones_like(L_norm, dtype=np.float32),
-            working_mask=base_background_mask.copy(),
             RG_field=np.zeros_like(L_norm, dtype=np.float32),
             BY_field=np.zeros_like(L_norm, dtype=np.float32),
             apply_alpha=np.zeros_like(L_norm, dtype=np.float32),
@@ -2201,7 +2185,6 @@ class BlotchEqualizerWindow(QMainWindow):
             return
 
         self.pipeline.range_soft = result["range_soft"]
-        self.pipeline.working_mask = result["working_mask"]
         self.mask_ready = True
         self.invalidate_fields()
 
@@ -2220,7 +2203,7 @@ class BlotchEqualizerWindow(QMainWindow):
 
         LOG.info(
             "Mask result #%d | elapsed=%.2fs | prep=%.3fs curve=%.3fs blur=%.3fs up=%.3fs | "
-            "scale=%.4f work_shape=%s cache_used=%s | range[min/max/mean]=%.4f/%.4f/%.4f | mask=%.2f%%",
+            "scale=%.4f work_shape=%s cache_used=%s | range[min/max/mean]=%.4f/%.4f/%.4f",
             result["revision"],
             result["elapsed"],
             result.get("prep_elapsed", 0.0),
@@ -2233,7 +2216,6 @@ class BlotchEqualizerWindow(QMainWindow):
             result["range_min"],
             result["range_max"],
             result["range_mean"],
-            result["working_mask_pct"],
         )
         self.status(f"Mask updated in {result['elapsed']:.1f}s. RG/BY fields need new Preview.")
 
@@ -2280,17 +2262,14 @@ class BlotchEqualizerWindow(QMainWindow):
         p = self.pipeline
         if p is None:
             raise RuntimeError("Pipeline is not loaded.")
-        if not np.any(p.working_mask):
-            raise RuntimeError("Working mask is empty. Adjust mask controls first.")
 
         rev = self.fields_revision
         sigma_lo = self.sigma_options[int(self.sigma_slider.value())]
         LOG.info(
-            "Fields preview start | revision=%d | sigma_lo=%d sigma_hi=%d | mask=%.2f%%",
+            "Fields preview start | revision=%d | sigma_lo=%d sigma_hi=%d",
             rev,
             sigma_lo,
             sigma_lo * 2,
-            float(np.mean(p.working_mask) * 100.0),
         )
 
         self.fields_thread = QThread(self)
@@ -2300,7 +2279,6 @@ class BlotchEqualizerWindow(QMainWindow):
             revision=rev,
             a=p.a,
             b=p.b,
-            working_mask=p.working_mask.copy(),
             range_soft=p.range_soft.copy(),
             sigma_lo=sigma_lo,
         )
@@ -2704,8 +2682,9 @@ class BlotchEqualizerWindow(QMainWindow):
             self.by_view.set_placeholder("BY preview not available")
             return
 
-        rg_rgb = heatmap_rgb(self.pipeline.RG_field, self.pipeline.working_mask, "RdYlGn_r")
-        by_rgb = heatmap_rgb(self.pipeline.BY_field, self.pipeline.working_mask, "coolwarm")
+        full_mask = np.ones(self.pipeline.RG_field.shape, dtype=bool)
+        rg_rgb = heatmap_rgb(self.pipeline.RG_field, full_mask, "RdYlGn_r")
+        by_rgb = heatmap_rgb(self.pipeline.BY_field, full_mask, "coolwarm")
 
         self.rg_view.set_image(rg_rgb)
         self.by_view.set_image(by_rgb)
