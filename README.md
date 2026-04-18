@@ -10,7 +10,7 @@ The tool performs a mask-aware correction in Lab color space using normalized bl
 
 This tool is designed for stretched, pre-final images.
 
-Use it as a last-resort correction step when your normal astrophotography workflow can no longer clean the background color blotches adequately.
+Use it as a last-resort correction step when your normal astrophotography workflow can no longer clean the background adequately.
 
 It is optimized for large-scale, low-frequency color artifacts in the background. It is not intended to fix high-frequency chroma noise or replace proper calibration and background extraction earlier in the pipeline.
 
