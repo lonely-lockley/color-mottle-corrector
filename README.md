@@ -13,7 +13,7 @@ The tool estimates large-scale low-frequency color bias in the background along 
 - red / green
 - blue / yellow
 
-These correction fields are built from masked Gaussian-blurred chroma data and recentered so that the algorithm targets relative background color bias rather than absolute image color.
+These correction fields are built from Gaussian-blurred chroma data and recentered so that the algorithm targets relative background color bias rather than absolute image color.
 
 A user-defined soft mask controls where correction is applied:
 
@@ -21,8 +21,14 @@ A user-defined soft mask controls where correction is applied:
 - unprotected regions receive the full intended correction
 - transition zones are blended smoothly
 
-The final correction pushes local chroma bias toward neutral rather than applying arbitrary recoloring.
+The correction is applied as:
 
+```
+a_corr = a - rg_k * RG_field * apply_alpha
+b_corr = b - by_k * BY_field * apply_alpha
+```
+
+The final correction pushes local chroma bias toward neutral instead of relying on saturation reduction or black point suppression to hide the artifact.
 
 ## Scope and Intended Use
 
