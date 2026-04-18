@@ -1184,6 +1184,7 @@ class CorrectionWorker(QObject):
 class BlotchEqualizerWindow(QMainWindow):
     def __init__(self, args):
         super().__init__()
+        self.siril_mode = bool(getattr(args, "siril", False))
         self.setWindowTitle("Chroma Blotch Corrector")
         self.resize(1500, 920)
         self.step_titles = [
@@ -1489,6 +1490,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.input_edit = QLineEdit()
         self.input_browse_btn = QPushButton("Browse")
         self.load_btn = QPushButton("Load")
+        self.continue_btn = QPushButton("Continue")
 
         row = QWidget()
         r = QHBoxLayout(row)
@@ -1498,10 +1500,13 @@ class BlotchEqualizerWindow(QMainWindow):
         self.input_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.input_browse_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._style_primary_action_button(self.load_btn)
+        self._style_primary_action_button(self.continue_btn)
 
-        lay.addWidget(QLabel("Input image (TIFF/FITS, 8/16-bit int or 32-bit float):"))
+        self.step1_input_label = QLabel("Input image (TIFF/FITS, 8/16-bit int or 32-bit float):")
+        lay.addWidget(self.step1_input_label)
         lay.addWidget(row)
         lay.addWidget(self.load_btn)
+        lay.addWidget(self.continue_btn)
         lay.addStretch(1)
 
         self.toolbox.addItem(page, self.step_titles[0])
@@ -1509,6 +1514,15 @@ class BlotchEqualizerWindow(QMainWindow):
         self.input_browse_btn.clicked.connect(self.on_browse_input)
         self.input_edit.editingFinished.connect(self.on_input_changed)
         self.load_btn.clicked.connect(self.on_load_clicked)
+        self.continue_btn.clicked.connect(lambda: self._open_next_step(0))
+
+        if self.siril_mode:
+            self.step1_input_label.setVisible(False)
+            row.setVisible(False)
+            self.load_btn.setVisible(False)
+            self.continue_btn.setVisible(True)
+        else:
+            self.continue_btn.setVisible(False)
 
     def _build_step2(self):
         page = QWidget()
@@ -1668,7 +1682,8 @@ class BlotchEqualizerWindow(QMainWindow):
         self.save_format_combo.addItem("FITS", "fits")
         self._populate_bitdepth_combo("tiff")
 
-        lay.addWidget(QLabel("Output file:"))
+        self.step5_output_label = QLabel("Output file:")
+        lay.addWidget(self.step5_output_label)
         lay.addWidget(row)
         lay.addWidget(format_row)
 
@@ -1684,6 +1699,11 @@ class BlotchEqualizerWindow(QMainWindow):
         self.save_format_combo.currentIndexChanged.connect(self.on_save_format_changed)
         self.save_bitdepth_combo.currentIndexChanged.connect(self.on_save_bitdepth_changed)
         self.save_btn.clicked.connect(self.on_save)
+
+        if self.siril_mode:
+            self.step5_output_label.setVisible(False)
+            row.setVisible(False)
+            format_row.setVisible(False)
 
     def _selected_save_format(self) -> str:
         return str(self.save_format_combo.currentData() or "tiff")
@@ -1787,7 +1807,10 @@ class BlotchEqualizerWindow(QMainWindow):
         input_path = Path(input_arg).expanduser().resolve() if input_arg else find_default_input(Path.cwd())
         if input_path is None:
             LOG.info("No default supported TIFF/FITS found in %s", Path.cwd())
-            self.status("No supported TIFF/FITS found. Select source file.")
+            if self.siril_mode:
+                self.status("Siril mode requires --input path.")
+            else:
+                self.status("No supported TIFF/FITS found. Select source file.")
             self.toolbox.setCurrentIndex(0)
             self.on_step_changed(0)
             self._refresh_step_titles()
@@ -1806,7 +1829,11 @@ class BlotchEqualizerWindow(QMainWindow):
         self.rg_view.set_placeholder("Load source first.")
         self.by_view.set_placeholder("Load source first.")
         self.corrected_view.set_placeholder("Load source first.")
-        self.status("Source preselected. Press Load to start.")
+        if self.siril_mode:
+            self.status("Siril mode: source preselected. Loading image...")
+            QTimer.singleShot(0, self.on_load_clicked)
+        else:
+            self.status("Source preselected. Press Load to start.")
         self.toolbox.setCurrentIndex(0)
         self.on_step_changed(0)
         self._refresh_step_titles()
@@ -1911,7 +1938,7 @@ class BlotchEqualizerWindow(QMainWindow):
         self.update_fields_view()
         self.update_corrected_view()
         self._set_save_defaults_from_loaded(input_format, input_bit_depth)
-        self.auto_open_step2_after_mask = self.auto_target_step == 0
+        self.auto_open_step2_after_mask = (self.auto_target_step == 0) and (not self.siril_mode)
         self.status("Image displayed. Recomputing mask in background...")
         QTimer.singleShot(0, self.request_mask_recompute)
 
@@ -2726,6 +2753,11 @@ def parse_args(argv: list[str]):
     parser = argparse.ArgumentParser(description="Standalone blotch equalizer (RG/BY background field correction)")
     parser.add_argument("--input", default="", help="Input TIFF/FITS image")
     parser.add_argument("--output", default="", help="Output image path (TIFF/FITS)")
+    parser.add_argument(
+        "--siril",
+        action="store_true",
+        help="Run in Siril integration mode (step1=Continue only, step5=Save only).",
+    )
     parser.add_argument("--log-dir", default="logs", help="Directory for info/debug logs")
     parser.add_argument(
         "--file-logs",
@@ -2752,9 +2784,10 @@ def main(argv: list[str]) -> int:
     LOG.info("Application start")
     LOG.info("CWD: %s", Path.cwd())
     LOG.info(
-        "Args: input=%s output=%s log_dir=%s file_logs=%s",
+        "Args: input=%s output=%s siril=%s log_dir=%s file_logs=%s",
         args.input,
         args.output,
+        args.siril,
         args.log_dir,
         args.file_logs,
     )
