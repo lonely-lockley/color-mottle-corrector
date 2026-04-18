@@ -8,6 +8,7 @@ __pycache__/
 *.so
 *.dylib
 *.egg-info/
+dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

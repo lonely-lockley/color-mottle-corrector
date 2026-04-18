@@ -31,6 +31,14 @@ Install from PyPI:
 pip install chroma-blotch-corrector
 ```
 
+## Run
+
+Start the application:
+
+```bash
+chroma-blotch-corrector
+```
+
 ## Workflow
 
 ### 1. Load Source Image
