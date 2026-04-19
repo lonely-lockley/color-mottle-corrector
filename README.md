@@ -2,7 +2,7 @@
 
 `color-mottle-corrector` is a standalone desktop tool for reducing large-scale background color mottle in stretched OSC astrophotography images.
 
-It is intended for cases where residual red/green and blue/yellow background imbalance remains visible after the normal processing pipeline, such as stacking, calibration, gradient removal, and color calibration.
+Color mottle is large-scale unwanted color unevenness in the background of stretched OSC astrophotography images. It usually appears as broad green, red, or magenta color casts and blotches, and sometimes as yellow or blue-yellow background tint. Unlike ordinary fine-grained chroma noise, color mottle affects wider areas of the image and often survives normal denoising, gradient removal, and color calibration.
 
 The correction is performed in CIE Lab space.
 
