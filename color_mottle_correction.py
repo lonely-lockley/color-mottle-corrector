@@ -1485,7 +1485,7 @@ class BlotchEqualizerWindow(QMainWindow):
         r.addWidget(self.input_browse_btn)
         self.input_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.input_browse_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self._style_primary_action_button(self.load_btn)
+        self._style_large_action_button(self.load_btn)
         self._style_primary_action_button(self.continue_btn)
 
         self.step1_input_label = QLabel("Input image (TIFF/FITS, 8/16-bit int or 32-bit float):")
