@@ -23,6 +23,12 @@ A user-defined soft mask controls where correction is applied:
 - unprotected regions receive the full intended correction
 - transition zones are blended smoothly
 
+In the UI mask preview, this is shown as:
+
+- **Black**: protected region, little or no correction
+- **White**: strongest correction
+- **Gray**: partial correction
+
 The correction is applied as:
 
 ```
@@ -72,6 +78,7 @@ color-mottle-corrector
 Choose an input TIFF or FITS file and click **Load**.
 
 The original image will appear in the preview area.
+When loading and initial mask preparation are complete, click **Next** to continue.
 
 ### 2. Build the Protection Mask
 
@@ -81,8 +88,8 @@ Adjust the curve and mask controls, then click **Apply mask**.
 
 Mask meaning:
 
-- **White**: protected region, no correction applied
-- **Black**: full correction applied
+- **Black**: protected region, little or no correction
+- **White**: full correction applied
 - **Gray**: partial correction, blended proportionally
 
 Use **Invert output** to invert the mask response.
@@ -104,6 +111,7 @@ Then click **Calculate** to build the `RG_field` and `BY_field`.
 ![](assets/field_calculation.jpg)
 
 The preview will show the low-frequency correction fields used to neutralize background color imbalance.
+These previews are additionally modulated by the effective correction mask (`apply_alpha`) so you can see where correction is actually applied.
 
 In most cases, the default value `32` works well and does not need adjustment.
 Tune this only if field geometry is detected incorrectly, for example when color mottle structures are captured too coarsely or too fragmentedly.

@@ -649,6 +649,15 @@ def heatmap_rgb(data: np.ndarray, mask: np.ndarray, cmap_name: str) -> np.ndarra
     return np.where(mask[..., None], rgb, bg).astype(np.float32)
 
 
+def overlay_correction_alpha(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    # Visualize only the effective correction area: low alpha is dimmed, high alpha is emphasized.
+    a = clamp01(alpha.astype(np.float32, copy=False))
+    a_vis = np.power(a, 0.75)
+    bg = np.ones_like(rgb, dtype=np.float32) * 0.06
+    out = bg * (1.0 - a_vis[..., None]) + rgb.astype(np.float32, copy=False) * a_vis[..., None]
+    return out.astype(np.float32, copy=False)
+
+
 def stretch_rgb_preview(rgb: np.ndarray) -> np.ndarray:
     x = clamp01(rgb.astype(np.float32, copy=False))
     if x.size == 0:
@@ -2667,10 +2676,9 @@ class BlotchEqualizerWindow(QMainWindow):
             self.mask_view.set_placeholder("Mask preview")
             return
 
-        soft = self.pipeline.range_soft
-
-        # Show soft grayscale mask driven by curve settings over the whole image.
-        gray = soft.astype(np.float32)
+        # Keep preview semantics aligned with field overlays:
+        # dark = protected (low correction), bright = stronger correction.
+        gray = clamp01(1.0 - self.pipeline.range_soft).astype(np.float32)
         mask_rgb = np.repeat(gray[..., None], 3, axis=2)
         self.mask_view.set_image(mask_rgb)
 
@@ -2688,6 +2696,8 @@ class BlotchEqualizerWindow(QMainWindow):
         full_mask = np.ones(self.pipeline.RG_field.shape, dtype=bool)
         rg_rgb = heatmap_rgb(self.pipeline.RG_field, full_mask, "RdYlGn_r")
         by_rgb = heatmap_rgb(self.pipeline.BY_field, full_mask, "coolwarm")
+        rg_rgb = overlay_correction_alpha(rg_rgb, self.pipeline.apply_alpha)
+        by_rgb = overlay_correction_alpha(by_rgb, self.pipeline.apply_alpha)
 
         self.rg_view.set_image(rg_rgb)
         self.by_view.set_image(by_rgb)
